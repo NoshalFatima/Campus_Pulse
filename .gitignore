@@ -49,3 +49,4 @@ android/build/
 android/app/build/
 .gradle/
 *.apk
+android/app/google-services.json
