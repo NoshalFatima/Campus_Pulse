@@ -251,7 +251,7 @@ class _AnnouncementFragmentState extends State<AnnouncementFragment> {
       backgroundColor: Colors.transparent,
       body: Container(
         width: double.infinity,
-        margin: const EdgeInsets.fromLTRB(15, 60, 15, 20),
+        margin: const EdgeInsets.fromLTRB(15, 27, 15, 20),
         child: Card(
           color: const Color(0xFFFDF2F3),
           elevation: 8,

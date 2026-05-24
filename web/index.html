@@ -45,14 +45,17 @@
 <script>
   window.OneSignalDeferred = window.OneSignalDeferred || [];
   OneSignalDeferred.push(async function(OneSignal) {
+    console.log("Onesignal script trigger started...");
     // Hum ne niche se direct ID mita kar window variable use kiya hai
     await OneSignal.init({
-      appId: window.onesignalAppId || "", 
-      allowLocalhostAsSecureOrigin: true,
-      notifyButton: {
-        enable: true,
+      appId: "02b5177a-5147-456c-aa7b-08912068cc01", 
+    allowLocalhostAsSecureOrigin: true, // 👈 Yeh line lazmi honi chahiye!
+    notifyButton: {
+      enable: true,
+      
       },
     });
+    console.log("Onesignal successfully initialized on Web!");
   });
 </script>
    

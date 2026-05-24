@@ -253,7 +253,7 @@ String uploadPreset = dotenv.env['CLOUDINARY_UPLOAD_PRESET'] ?? '';
       body: Container(
         width: double.infinity,
         // ✅ Same margins as StudentAnnouncementFragment
-        margin: const EdgeInsets.fromLTRB(15, 25, 15, 60),
+        margin: const EdgeInsets.fromLTRB(15, 27, 15, 60),
         decoration: BoxDecoration(
           color: _bg,
           borderRadius: BorderRadius.circular(30),

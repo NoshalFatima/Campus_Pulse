@@ -1,22 +1,4 @@
 // lib/Student/student_attendance_module.dart
-//
-// FIXES IN THIS VERSION:
-//
-// FIX 1 — GPS Out of Range randomly:
-//   Root cause: GPS accuracy indoors can be 50-100m so student appears
-//   outside radius even when physically present.
-//   Fix: effective radius = teacher_radius + student_gps_accuracy + 30m buffer
-//   This means if accuracy is 60m the allowed zone expands accordingly.
-//
-// FIX 2 — "Bad state: failed precondition" inference error:
-//   Root cause: interpreter was called right after takePicture() while
-//   camera was still active. Interpreter state was corrupt.
-//   Fix: camera fully disposed BEFORE inference. Added await + delay.
-//   Also interpreter is re-initialized if null before each attempt.
-//
-// FIX 3 — Torch/Flash control:
-//   Flash toggle button added to camera UI.
-//   Auto-detects if torch is available.
 
 import 'dart:async';
 import 'dart:typed_data';
@@ -31,15 +13,14 @@ import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
 import 'package:image/image.dart' as img;
 import 'package:intl/intl.dart';
 import 'package:permission_handler/permission_handler.dart';
-import 'package:cloud_firestore/cloud_firestore.dart' ;
-import 'package:firebase_database/firebase_database.dart' as rtdb ;
+import 'package:firebase_database/firebase_database.dart' as rtdb;
 import '../services/face_service.dart';
+import 'student_view_attendance.dart';
 import '../services/onesignal_service.dart';
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
 // DATA MODELS
-// ─────────────────────────────────────────────────────────────────────────────
-
+// ─────────────────────────────────────────────────────────────
 class _SessionData {
   final double lat, lon, radius;
   final String faculty, subject, dept, sem, shift, status;
@@ -71,10 +52,9 @@ class _StudentProfile {
   });
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
 // WIDGET
-// ─────────────────────────────────────────────────────────────────────────────
-
+// ─────────────────────────────────────────────────────────────
 class StudentAttendanceFragment extends StatefulWidget {
   const StudentAttendanceFragment({super.key});
   @override
@@ -84,10 +64,10 @@ class StudentAttendanceFragment extends StatefulWidget {
 class _State extends State<StudentAttendanceFragment>
     with WidgetsBindingObserver {
 
-  final _face  = FaceService.instance;
-  final _db    = rtdb.FirebaseDatabase.instance;
-  final _fs    = FirebaseFirestore.instance;
-  final _auth  = FirebaseAuth.instance;
+  final _face = FaceService.instance;
+  final _db   = rtdb.FirebaseDatabase.instance;
+  final _fs   = FirebaseFirestore.instance;
+  final _auth = FirebaseAuth.instance;
 
   late final FaceDetector _detector = FaceDetector(
     options: FaceDetectorOptions(
@@ -96,15 +76,16 @@ class _State extends State<StudentAttendanceFragment>
     ),
   );
 
-  // ── Camera ─────────────────────────────────────────────────────────────────
+  // Camera
   CameraController? _camera;
-  bool _cameraReady   = false;
-  bool _showCamera    = false;
-  bool _torchOn       = false;
-  bool _torchAvail    = false;
+  bool _cameraReady = false;
+  bool _showCamera  = false;
+  bool _torchOn     = false;
+  bool _torchAvail  = false;
 
-  // ── State ──────────────────────────────────────────────────────────────────
+  // State
   _StudentProfile? _profile;
+  String _activeSessionPath = ''; // subject-level session path
   _SessionData?    _session;
   List<double>?    _storedEmbedding;
 
@@ -117,13 +98,13 @@ class _State extends State<StudentAttendanceFragment>
   StreamSubscription<rtdb.DatabaseEvent>? _sessionSub;
   String _liveStatus = 'unknown';
 
-  // ── Blink ──────────────────────────────────────────────────────────────────
-  bool  _blinkDetected   = false;
-  bool  _processingFrame = false;
+  // Blink
+  bool   _blinkDetected   = false;
+  bool   _processingFrame = false;
   Timer? _blinkTimeout;
   Timer? _frameTimer;
 
-  // ─────────────────────────────────────────────────────────────────────────
+  // ── Init ────────────────────────────────────────────────────
   @override
   void initState() {
     super.initState();
@@ -146,15 +127,10 @@ class _State extends State<StudentAttendanceFragment>
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.paused ||
-        state == AppLifecycleState.inactive) {
-      _destroyCamera();
-    }
+        state == AppLifecycleState.inactive) _destroyCamera();
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // PROFILE
-  // ─────────────────────────────────────────────────────────────────────────
-
+  // ── Profile ─────────────────────────────────────────────────
   Future<void> _loadProfile() async {
     try {
       final uid = _auth.currentUser?.uid;
@@ -163,7 +139,7 @@ class _State extends State<StudentAttendanceFragment>
       final doc = await _fs.collection('Users').doc(uid).get();
       if (!doc.exists) return;
 
-      final d = doc.data()!;
+      final d     = doc.data()!;
       final dept  = d['dept']?.toString()     ?? '';
       final sem   = d['semester']?.toString() ?? d['sem']?.toString() ?? '';
       final shift = d['shift']?.toString()    ?? '';
@@ -191,14 +167,40 @@ class _State extends State<StudentAttendanceFragment>
 
   void _watchSession(String path) {
     _sessionSub?.cancel();
-    _sessionSub = _db.ref('AttendanceSession/$path/status').onValue.listen((e) {
-      final s = e.snapshot.value?.toString() ?? 'none';
-      if (s != _liveStatus && mounted) {
-        setState(() => _liveStatus = s);
-        if (s != 'allowed' && _showCamera) {
+    _sessionSub = _db.ref('AttendanceSession/$path').onValue.listen((e) {
+      if (!mounted) return;
+      final data = e.snapshot.value;
+      String newStatus = 'none';
+
+      if (data is Map) {
+        if (data.containsKey('status')) {
+          // Old format
+          newStatus = data['status']?.toString() ?? 'none';
+        } else {
+          // New format: SESSION_ID children
+          // Check if ANY session is 'allowed'
+          bool anyAllowed = false;
+          for (final val in data.values) {
+            if (val is Map) {
+              final s = val['status']?.toString();
+              if (s == 'allowed') { anyAllowed = true; break; }
+            }
+          }
+          newStatus = anyAllowed ? 'allowed' : 'set';
+        }
+      }
+
+      if (newStatus != _liveStatus && mounted) {
+        setState(() => _liveStatus = newStatus);
+        // Camera was open and session closed
+        if (newStatus != 'allowed' && _showCamera) {
           _ui('Session Closed', 'Teacher stopped the attendance session.');
           _destroyCamera();
-          setState(() { _showCamera = false; _showBtn = false; _showRetry = true; });
+          setState(() { _showCamera=false; _showBtn=false; _showRetry=true; });
+        }
+        // Session became active — show button
+        if (newStatus == 'allowed' && !_showCamera && !_showRetry) {
+          setState(() { _showBtn = true; });
         }
       }
     });
@@ -206,23 +208,43 @@ class _State extends State<StudentAttendanceFragment>
 
   Future<void> _loadSessionData(String path) async {
     try {
-      final snap = await _db.ref('AttendanceSession/$path').get()
+      final snap = await _db
+          .ref('AttendanceSession/$path')
+          .get()
           .timeout(const Duration(seconds: 8));
       if (snap.exists && snap.value != null) {
-        final s = _SessionData.fromMap(snap.value as Map);
-        if (mounted) setState(() { _session = s; _liveStatus = s.status; });
+        final data = Map<String, dynamic>.from(snap.value as Map);
+        String status = 'none';
+
+        if (data.containsKey('status')) {
+          // Old format
+          final s = _SessionData.fromMap(data);
+          if (mounted) setState(() { _session = s; _liveStatus = s.status; });
+          return;
+        }
+
+        // New format: find any allowed session
+        for (final entry in data.entries) {
+          if (entry.value is Map) {
+            final subMap = Map<String, dynamic>.from(entry.value as Map);
+            if (subMap['status']?.toString() == 'allowed') {
+              status = 'allowed';
+              final s = _SessionData.fromMap(subMap);
+              if (mounted) setState(() { _session = s; _liveStatus = 'allowed'; });
+              return;
+            }
+          }
+        }
+        // No allowed session — check if any exists
+        if (mounted) setState(() => _liveStatus = status);
       }
     } catch (e) {
       debugPrint('Session data: $e');
     }
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // STEP 1: START
-  // ─────────────────────────────────────────────────────────────────────────
-
+  // ── Step 1: Start ────────────────────────────────────────────
   Future<void> _start() async {
-    // Re-init model if it was reset after a failed inference
     if (!_face.isReady) {
       _ui('Loading Model…', 'Initializing face recognition…');
       try {
@@ -237,7 +259,7 @@ class _State extends State<StudentAttendanceFragment>
     final loc = await Permission.location.request();
     if (!cam.isGranted || !loc.isGranted) {
       _ui('Permission Required', 'Camera and location permissions are needed.');
-      setState(() { _showBtn = true; });
+      setState(() => _showBtn = true);
       return;
     }
 
@@ -253,9 +275,20 @@ class _State extends State<StudentAttendanceFragment>
 
       _storedEmbedding = _face.parseStoredEmbedding(_profile!.faceData);
       if (_storedEmbedding == null || _storedEmbedding!.isEmpty) {
-        _fail('Face data missing from profile. Please re-register your face.');
+        _fail('Face data missing. Please re-register your face.');
         return;
       }
+
+      // ── KEY FIX: check if stored embedding is all zeros ──────
+      final allZeros = _storedEmbedding!.every((v) => v == 0.0);
+      if (allZeros) {
+        _fail('Your face data is invalid (all zeros).\n'
+              'Please go to Profile and re-scan your face.');
+        return;
+      }
+
+      print('✅ Stored embedding loaded — '
+            'first 3: ${_storedEmbedding!.take(3).toList()}');
 
       await _validateSession();
     } catch (e) {
@@ -263,26 +296,70 @@ class _State extends State<StudentAttendanceFragment>
     }
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // STEP 2: SESSION VALIDATION
-  // ─────────────────────────────────────────────────────────────────────────
-
+  // ── Step 2: Session ──────────────────────────────────────────
   Future<void> _validateSession() async {
-    _ui('Checking Session…', 'Looking for active attendance…');
-
+    _ui('Checking Session...', 'Looking for active attendance...');
     try {
-      final snap = await _db
-          .ref('AttendanceSession/${_profile!.sessionPath}')
+      final sessionRef = 'AttendanceSession/' + _profile!.sessionPath;
+      debugPrint('=== SESSION DEBUG ===');
+      debugPrint('Student sessionPath: ' + _profile!.sessionPath);
+      debugPrint('Fetching: ' + sessionRef);
+
+      final classSnap = await _db
+          .ref(sessionRef)
           .get()
           .timeout(const Duration(seconds: 10));
 
-      if (!snap.exists || snap.value == null) {
-        _fail('No session found for your class.\nWait for your teacher to start attendance.');
+      debugPrint('Snap exists: ' + classSnap.exists.toString());
+      debugPrint('Snap value: ' + classSnap.value.toString());
+
+      if (!classSnap.exists || classSnap.value == null) {
+        _fail('No session found for your class.\n'
+              'Path checked: ' + sessionRef + '\n'
+              'Wait for your teacher to start attendance.');
         return;
       }
 
-      final s = _SessionData.fromMap(snap.value as Map);
+      Map? activeSessionMap;
+      String activeSubjectPath = '';
+
+      final classData = Map<String, dynamic>.from(classSnap.value as Map);
+
+      // classData may contain BOTH direct fields (old format pollution)
+      // AND SESSION_ID child nodes (new format)
+      // Strategy: look for SESSION_ID children (Map values) with status=allowed FIRST
+      // Only fall back to direct status if no session children found
+
+      // Step 1: find any SESSION_ID child with status=allowed
+      for (final entry in classData.entries) {
+        if (entry.value is Map) {
+          final subMap = Map<String, dynamic>.from(entry.value as Map);
+          if (subMap['status']?.toString() == 'allowed') {
+            activeSessionMap  = subMap;
+            activeSubjectPath = _profile!.sessionPath + '/' + entry.key;
+            debugPrint('Found active session: ' + entry.key);
+            break;
+          }
+        }
+      }
+
+      // Step 2: if no active session found in children, check direct status (old format)
+      if (activeSessionMap == null && classData.containsKey('status')) {
+        if (classData['status']?.toString() == 'allowed') {
+          activeSessionMap  = classData;
+          activeSubjectPath = _profile!.sessionPath;
+          debugPrint('Found active session (old format)');
+        }
+      }
+
+      if (activeSessionMap == null) {
+        _fail('No active session.\nWait for your teacher to start attendance.');
+        return;
+      }
+
+      final s = _SessionData.fromMap(activeSessionMap);
       _session = s;
+      _activeSessionPath = activeSubjectPath;
 
       if (s.status != 'allowed') {
         _fail(s.status == 'stopped'
@@ -291,7 +368,6 @@ class _State extends State<StudentAttendanceFragment>
         return;
       }
 
-      // Normalize comparison
       String numOnly(String v) => v.replaceAll(RegExp(r'[^0-9]'), '');
       String norm(String v)    => v.trim().replaceAll(' ', '_').toUpperCase();
 
@@ -300,18 +376,21 @@ class _State extends State<StudentAttendanceFragment>
                  norm(_profile!.shift)  == norm(s.shift);
 
       if (!ok) {
-        _fail('This session is for ${s.dept} ${s.sem} ${s.shift}.\n'
-              'Your class: ${_profile!.dept} ${_profile!.sem} ${_profile!.shift}');
+        _fail('Session is for ' + s.dept + ' ' + s.sem + ' ' + s.shift + '.\nYour class: ' + _profile!.dept + ' ' + _profile!.sem + ' ' + _profile!.shift);
         return;
       }
 
-      // Duplicate check
-      final today = DateFormat('yyyy-MM-dd').format(DateTime.now());
-      final dup   = await _db
-          .ref('AttendanceRecords/${_profile!.sessionPath}/$today/${_profile!.uid}')
+      final today      = DateFormat('yyyy-MM-dd').format(DateTime.now());
+      final pathParts  = _activeSessionPath.split('/');
+      final dupClass   = pathParts.first.isNotEmpty
+          ? pathParts.first : _profile!.sessionPath;
+      final dupSession = pathParts.length > 1 ? pathParts.last
+          : (s.subject).trim().replaceAll(' ', '_').toUpperCase();
+      final dup = await _db
+          .ref('AttendanceRecords/' + dupClass + '/' + dupSession + '/' + today + '/' + _profile!.uid)
           .get();
       if (dup.exists) {
-        _ui('Already Marked', 'Your attendance is already recorded for today.');
+        _ui('Already Marked', 'Attendance already recorded for today.');
         setState(() { _loading = false; _showBtn = false; _showRetry = false; });
         return;
       }
@@ -319,17 +398,13 @@ class _State extends State<StudentAttendanceFragment>
       if (mounted) setState(() => _liveStatus = 'allowed');
       await _validateGps();
     } catch (e) {
-      _fail('Session error: $e');
+      _fail('Session error: \$e');
     }
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // STEP 3: GPS — FIX 1: dynamic radius based on accuracy
-  // ─────────────────────────────────────────────────────────────────────────
-
+  // ── Step 3: GPS ──────────────────────────────────────────────
   Future<void> _validateGps() async {
     _ui('GPS Check', 'Verifying your location…');
-
     try {
       if (!await Geolocator.isLocationServiceEnabled()) {
         _ui('GPS Disabled', 'Please enable GPS and try again.');
@@ -339,9 +414,7 @@ class _State extends State<StudentAttendanceFragment>
       }
 
       final pos = await _getBestPosition();
-
       if (pos == null) {
-        // No GPS — proceed without location check
         print('GPS: No position, proceeding');
         await _startCamera();
         return;
@@ -351,8 +424,6 @@ class _State extends State<StudentAttendanceFragment>
         pos.latitude, pos.longitude,
         _session!.lat, _session!.lon,
       );
-
-      // FIX 1: effective radius includes GPS accuracy + 30m indoor buffer
       final effectiveRadius = _session!.radius + pos.accuracy + 30.0;
 
       print('GPS: dist=${dist.toStringAsFixed(1)}m '
@@ -377,8 +448,8 @@ class _State extends State<StudentAttendanceFragment>
     Position? best;
     const goodAccuracy = 35.0;
     final completer = Completer<Position?>();
-
     StreamSubscription<Position>? sub;
+
     sub = Geolocator.getPositionStream(
       locationSettings: const LocationSettings(
         accuracy: LocationAccuracy.high,
@@ -402,30 +473,23 @@ class _State extends State<StudentAttendanceFragment>
     return result;
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // STEP 4: CAMERA WITH TORCH — FIX 3
-  // ─────────────────────────────────────────────────────────────────────────
-
+  // ── Step 4: Camera ───────────────────────────────────────────
   Future<void> _startCamera() async {
     _ui('Opening Camera', 'Please wait…');
-
     try {
       final cameras = await availableCameras();
-      final front = cameras.firstWhere(
+      final front   = cameras.firstWhere(
         (c) => c.lensDirection == CameraLensDirection.front,
         orElse: () => cameras.first,
       );
 
       _camera = CameraController(
-        front,
-        ResolutionPreset.high,
+        front, ResolutionPreset.high,
         enableAudio: false,
         imageFormatGroup: ImageFormatGroup.nv21,
       );
-
       await _camera!.initialize();
 
-      // Check torch availability
       try {
         await _camera!.setFlashMode(FlashMode.torch);
         await _camera!.setFlashMode(FlashMode.off);
@@ -444,22 +508,25 @@ class _State extends State<StudentAttendanceFragment>
       });
 
       _ui('Blink Once', 'Look at camera and blink once to verify liveness');
-
-      _blinkDetected    = false;
-      _processingFrame  = false;
+      _blinkDetected   = false;
+      _processingFrame = false;
 
       _blinkTimeout = Timer(const Duration(seconds: 45), () {
         if (!_blinkDetected && mounted) {
-          _ui('Timeout', 'No blink detected in 45 seconds. Please try again.');
+          _ui('Timeout', 'No blink detected. Please try again.');
           _destroyCamera();
-          setState(() { _showCamera = false; _showRetry = true; _showBtn = false; });
+          setState(() {
+            _showCamera = false;
+            _showRetry  = true;
+            _showBtn    = false;
+          });
         }
       });
 
-      _frameTimer = Timer.periodic(const Duration(milliseconds: 400), (_) {
-        if (!_blinkDetected && !_processingFrame) _analyzeFrame();
-      });
-
+      _frameTimer = Timer.periodic(
+        const Duration(milliseconds: 400), (_) {
+          if (!_blinkDetected && !_processingFrame) _analyzeFrame();
+        });
     } catch (e) {
       _fail('Camera error: $e');
     }
@@ -473,27 +540,23 @@ class _State extends State<StudentAttendanceFragment>
           _torchOn ? FlashMode.torch : FlashMode.off);
       if (mounted) setState(() {});
     } catch (e) {
-      debugPrint('Torch toggle: $e');
+      debugPrint('Torch: $e');
     }
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // STEP 5: BLINK DETECTION
-  // ─────────────────────────────────────────────────────────────────────────
-
+  // ── Step 5: Blink detection ──────────────────────────────────
   Future<void> _analyzeFrame() async {
     if (_camera == null || !_cameraReady || _blinkDetected) return;
     if (!(_camera?.value.isInitialized ?? false)) return;
 
     _processingFrame = true;
     try {
-      final xfile = await _camera!.takePicture();
-
+      final xfile      = await _camera!.takePicture();
       final inputImage = InputImage.fromFilePath(xfile.path);
       final faces      = await _detector.processImage(inputImage);
 
       if (faces.isEmpty) {
-        if (mounted) _ui('Blink Once', 'No face detected — look directly at camera');
+        if (mounted) _ui('Blink Once', 'No face detected — look at camera');
         _processingFrame = false;
         return;
       }
@@ -501,19 +564,15 @@ class _State extends State<StudentAttendanceFragment>
       final face = faces.first;
       final L    = face.leftEyeOpenProbability  ?? 1.0;
       final R    = face.rightEyeOpenProbability ?? 1.0;
-
       print('Eyes: L=${L.toStringAsFixed(2)} R=${R.toStringAsFixed(2)}');
 
       if (L < 0.25 && R < 0.25) {
-        // Blink confirmed
         _blinkDetected = true;
         _blinkTimeout?.cancel();
         _frameTimer?.cancel();
 
         if (mounted) _ui('Blink Detected!', 'Capturing face for verification…');
-
-        // Small delay so eyes are open again for face capture
-        await Future.delayed(const Duration(milliseconds: 400));
+        await Future.delayed(const Duration(milliseconds: 500));
         await _captureAndMatch();
       } else {
         if (mounted) _ui('Blink Once', 'Eyes open — please blink once naturally');
@@ -525,146 +584,286 @@ class _State extends State<StudentAttendanceFragment>
     }
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // STEP 6: CAPTURE + MATCH — FIX 2: camera disposed BEFORE inference
-  // ─────────────────────────────────────────────────────────────────────────
-
+  // ── Step 6: Capture + Match ──────────────────────────────────
+  // KEY FIX: use matchFace() which re-normalizes before comparing
   Future<void> _captureAndMatch() async {
     try {
       if (mounted) setState(() => _loading = true);
 
-      // Capture final clear photo while eyes are open
       if (_camera == null || !_cameraReady) {
         _fail('Camera not ready. Please try again.');
         return;
       }
 
-      // Turn off torch before capture for consistent lighting
       if (_torchOn) {
         try { await _camera!.setFlashMode(FlashMode.off); } catch (_) {}
       }
 
-      final xfile = await _camera!.takePicture();
-      final bytes = await xfile.readAsBytes();
+      // EXACT SAME LOGIC AS face_capture_screen.dart (signup)
+      // Step 1: takePicture → decode raw JPEG
+      // Step 2: MLKit on RAW file → get bounding box in raw space
+      // Step 3: crop from RAW image (coords match)
+      // Step 4: bakeOrientation on cropped face only
+      // Step 5: extract embedding
+      // Take 3 frames, pick best similarity
+      _ui('Verifying Identity...', 'Hold still...');
 
-      // FIX 2: FULLY DESTROY camera BEFORE calling inference
-      // This prevents "bad state: failed precondition"
+      final List<img.Image> candidates = [];
+
+      for (int attempt = 0; attempt < 3; attempt++) {
+        try {
+          await Future.delayed(const Duration(milliseconds: 300));
+          if (_camera == null || !(_camera!.value.isInitialized)) break;
+
+          // takePicture — same as signup
+          final xf    = await _camera!.takePicture();
+          final bytes = await xf.readAsBytes();
+
+          // Decode RAW (no bakeOrientation yet)
+          final raw = img.decodeImage(Uint8List.fromList(bytes));
+          if (raw == null) continue;
+
+          // MLKit on RAW file — bbox in raw coordinate space
+          final inputImg = InputImage.fromFilePath(xf.path);
+          final faces    = await _detector.processImage(inputImg);
+          if (faces.isEmpty) {
+            print('Frame ' + attempt.toString() + ': no face');
+            continue;
+          }
+
+          final face = faces.first;
+          final eyeOpen = ((face.leftEyeOpenProbability  ?? 1.0) +
+                           (face.rightEyeOpenProbability ?? 1.0)) / 2.0;
+          if (eyeOpen < 0.5) {
+            print('Skip frame ' + attempt.toString() + ' eyes closed');
+            continue;
+          }
+
+          // Crop from RAW (same coord space as MLKit bbox)
+          final b   = face.boundingBox;
+          final L   = (b.left   - b.width  * 0.2).clamp(0.0, raw.width  - 1.0).toInt();
+          final T   = (b.top    - b.height * 0.2).clamp(0.0, raw.height - 1.0).toInt();
+          final R   = (b.right  + b.width  * 0.2).clamp(0.0, raw.width  - 1.0).toInt();
+          final BB  = (b.bottom + b.height * 0.2).clamp(0.0, raw.height - 1.0).toInt();
+          if (R - L < 20 || BB - T < 20) continue;
+
+          final rawCrop = img.copyCrop(raw, x: L, y: T, width: R - L, height: BB - T);
+
+          // bakeOrientation on crop only — same as face_capture_screen.dart
+          final oriented = img.bakeOrientation(rawCrop);
+          candidates.add(oriented);
+
+          print('Frame ' + attempt.toString()
+              + ' eye=' + eyeOpen.toStringAsFixed(2)
+              + ' crop=' + oriented.width.toString() + 'x' + oriented.height.toString());
+        } catch (e) {
+          print('Frame ' + attempt.toString() + ' error: ' + e.toString());
+        }
+      }
+
+      // Destroy camera BEFORE inference
       await _destroyCamera();
       if (mounted) setState(() { _showCamera = false; _cameraReady = false; });
-
-      // Give a frame for UI to update
       await Future.delayed(const Duration(milliseconds: 200));
 
-      _ui('Verifying Identity…', 'Analyzing your face…');
-
-      // Decode image
-      final decoded = img.decodeImage(Uint8List.fromList(bytes));
-      if (decoded == null) {
-        _fail('Could not process photo. Please try again.');
+      if (candidates.isEmpty) {
+        _fail('No face detected in any frame.Look straight at camera and try again.');
         return;
       }
 
-      // Re-init interpreter if it was reset
+      _ui('Verifying Identity...', 'Analyzing face...');
+
+      // Init model if needed
       if (!_face.isReady) {
-        try {
-          await _face.init();
-        } catch (e) {
+        try { await _face.init(); } catch (e) {
           _fail('Face model not ready. Please restart the app.');
           return;
         }
       }
 
-      // Extract embedding
-      final List<double> liveEmbedding;
-      try {
-        liveEmbedding = _face.extractEmbeddingFromImage(decoded);
-      } catch (e) {
-        _fail('Face analysis failed.\nEnsure good lighting and face clearly visible.\nTry again.');
+      // Pick candidate with best similarity to stored embedding
+      List<double> bestEmbedding = [];
+      double bestSimilarity = 0.0;
+
+      for (final candidate in candidates) {
+        try {
+          final emb = _face.extractEmbeddingFromImage(candidate);
+          final sim = _face.cosineSimilarity(emb, _storedEmbedding!);
+          print('Candidate sim=' + (sim * 100).toStringAsFixed(1) + '%');
+          if (sim > bestSimilarity) {
+            bestSimilarity = sim;
+            bestEmbedding  = emb;
+          }
+        } catch (e) {
+          print('Embed error: ' + e.toString());
+        }
+      }
+
+      if (bestEmbedding.isEmpty) {
+        _fail('Face analysis failed. Ensure good lighting and try again.');
         return;
       }
 
-      // Compare
+      final List<double> liveEmbedding = bestEmbedding;
+      print('Best: ' + (bestSimilarity * 100).toStringAsFixed(1) + '%');
+      print('Live   first3: ' + liveEmbedding.take(3).toList().toString());
+      print('Stored first3: ' + _storedEmbedding!.take(3).toList().toString());
+
       if (_storedEmbedding == null || _storedEmbedding!.isEmpty) {
         _fail('Stored face data missing. Please re-register.');
         return;
       }
 
-      final similarity = _face.cosineSimilarity(_storedEmbedding!, liveEmbedding);
-      final pct = (similarity * 100).toStringAsFixed(1);
-      print('Face match: $pct% (threshold: ${(kSimilarityThreshold * 100).toStringAsFixed(0)}%)');
+      final matched    = _face.matchFace(liveEmbedding, _storedEmbedding!);
+      final similarity = _face.cosineSimilarity(liveEmbedding, _storedEmbedding!);
+      final pct        = (similarity * 100).toStringAsFixed(1);
+      print('Match: ' + pct + '% matched=' + matched.toString());
 
-      if (similarity >= kSimilarityThreshold) {
-        _ui('Identity Verified! ✅', 'Match: $pct% — saving attendance…');
+      if (matched) {
+        _ui('Identity Verified!', 'Match: ' + pct + '% - saving attendance...');
         await _markAttendance();
       } else {
-        _fail('Face not matched ($pct%).\n'
-              'Tips:\n'
-              '• Use the torch button if lighting is poor\n'
-              '• Look straight at camera\n'
-              '• Remove glasses if wearing any');
+        _fail('Face not matched (' + pct + '%).'
+              'Tips:'
+              '- Good lighting - use torch if dark'
+              '- Look straight at camera'
+              '- Remove glasses'
+              '- Re-scan face in Profile if issue persists');
       }
     } catch (e) {
-      _fail('Verification error: $e');
+      _fail('Verification error: ' + e.toString());
     }
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // STEP 7: MARK ATTENDANCE
-  // ─────────────────────────────────────────────────────────────────────────
-
+  // ── Step 7: Mark attendance ──────────────────────────────────
   Future<void> _markAttendance() async {
     try {
       final today = DateFormat('yyyy-MM-dd').format(DateTime.now());
-      final ref   = _db.ref(
-        'AttendanceRecords/${_profile!.sessionPath}/$today/${_profile!.uid}',
+
+      // _activeSessionPath = CLASS/SESSION_ID
+      // e.g. COMPUTER_SCIENCE_S8_MORNING/AI_1748234567890
+      final pathParts = _activeSessionPath.split('/');
+      final classPath = pathParts.first;
+      final sessionId = pathParts.length > 1
+          ? pathParts.last
+          : (_session?.subject ?? 'GENERAL')
+              .trim().replaceAll(' ', '_').toUpperCase();
+
+      final ref = _db.ref(
+        'AttendanceRecords/$classPath/$sessionId/$today/${_profile!.uid}',
       );
 
       await Future.delayed(
         Duration(milliseconds: DateTime.now().millisecondsSinceEpoch % 500),
       );
 
+      // Fetch student details for record
+      String studentName  = '';
+      String studentRegNo = '';
+      try {
+        final userDoc = await _fs.collection('Users').doc(_profile!.uid).get();
+        studentName  = userDoc.data()?['name']?.toString()  ?? '';
+        studentRegNo = userDoc.data()?['regNo']?.toString() ?? '';
+      } catch (_) {}
+
       final result = await ref.runTransaction((current) {
         if (current != null) return rtdb.Transaction.abort();
         return rtdb.Transaction.success({
-          'status':       'Present',
-          'timestamp':    DateTime.now().millisecondsSinceEpoch,
+          'status'      : 'Present',
+          'timestamp'   : DateTime.now().millisecondsSinceEpoch,
           'verification': 'Face+GPS+Liveness',
+          'name'        : studentName,
+          'regNo'       : studentRegNo,
+          'uid'         : _profile!.uid,
+          'subject'     : _session?.subject ?? '',
+          'subjectKey'  : sessionId,
+          'dept'        : _profile!.dept,
+          'semester'    : _profile!.sem,
+          'shift'       : _profile!.shift,
         });
       });
 
       if (!result.committed) {
-        _ui('Already Marked ✅', 'Your attendance is already recorded for today.');
+        _ui('Already Marked ✅', 'Attendance already recorded for today.');
         setState(() { _loading = false; _showBtn = false; _showRetry = false; });
         return;
       }
 
       if (mounted) {
         _ui('Attendance Recorded! ✅',
-            'Your presence has been verified and saved successfully.');
+            'Your presence has been verified and saved.');
         setState(() { _loading = false; _showBtn = false; _showRetry = false; });
       }
 
+      // Mark absent for any OTHER sessions today where student was absent
+      await _markAbsentForMissedSessions();
+
       await Future.delayed(const Duration(milliseconds: 2500));
-      if (mounted) Navigator.pop(context);
+      if (mounted) {
+        Navigator.of(context).popUntil((route) => route.isFirst);
+      }
     } catch (e) {
       _fail('Save failed: $e');
     }
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // HELPERS
-  // ─────────────────────────────────────────────────────────────────────────
+  // ── Helpers ──────────────────────────────────────────────────
+  // Mark absent for all sessions that happened today for this class
+  // where this student did NOT mark attendance
+  Future<void> _markAbsentForMissedSessions() async {
+    try {
+      final today      = DateFormat('yyyy-MM-dd').format(DateTime.now());
+      final classSnap  = await _db
+          .ref('AttendanceRecords/${_profile!.sessionPath}')
+          .get();
+
+      if (!classSnap.exists || classSnap.value == null) return;
+
+      final classData = Map<String, dynamic>.from(classSnap.value as Map);
+
+      for (final subjectKey in classData.keys) {
+        final subjectData = classData[subjectKey];
+        if (subjectData is! Map) continue;
+
+        // Check if today has records (session existed)
+        final todayData = subjectData[today];
+        if (todayData == null) continue; // no session today for this subject
+
+        // Check if student already has a record
+        final Map<String, dynamic> dayMap =
+            Map<String, dynamic>.from(todayData as Map);
+        if (dayMap.containsKey(_profile!.uid)) continue; // already marked
+
+        // Session existed but student not present — mark absent
+        await _db
+            .ref('AttendanceRecords/${_profile!.sessionPath}'
+                 '/$subjectKey/$today/${_profile!.uid}')
+            .set({
+          'status'      : 'Absent',
+          'timestamp'   : DateTime.now().millisecondsSinceEpoch,
+          'verification': 'Auto-marked',
+          'name'        : _profile!.uid,
+          'uid'         : _profile!.uid,
+          'subject'     : subjectKey.replaceAll('_', ' '),
+          'dept'        : _profile!.dept,
+          'semester'    : _profile!.sem,
+          'shift'       : _profile!.shift,
+        });
+        debugPrint('Auto-marked absent: $subjectKey');
+      }
+    } catch (e) {
+      debugPrint('markAbsent error: $e');
+    }
+  }
 
   Future<void> _destroyCamera() async {
     _blinkTimeout?.cancel();
     _frameTimer?.cancel();
     _processingFrame = false;
     _torchOn         = false;
-
     final ctrl = _camera;
-    _camera = null;
+    _camera    = null;
     if (mounted) setState(() { _cameraReady = false; _showCamera = false; });
-
     await Future.delayed(const Duration(milliseconds: 150));
     try { await ctrl?.dispose(); } catch (_) {}
   }
@@ -699,10 +898,7 @@ class _State extends State<StudentAttendanceFragment>
     _loadProfile();
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // BUILD
-  // ─────────────────────────────────────────────────────────────────────────
-
+  // ── Build ────────────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
     if (kIsWeb) return _webScreen();
@@ -710,56 +906,53 @@ class _State extends State<StudentAttendanceFragment>
     return Scaffold(
       backgroundColor: Colors.transparent,
       body: Container(
-        margin: const EdgeInsets.fromLTRB(18, 10, 18, 20),
+        margin: const EdgeInsets.fromLTRB(18, 27, 18, 20),
         decoration: BoxDecoration(
           color: const Color(0xFFFDF2F3),
           borderRadius: BorderRadius.circular(32),
           border: Border.all(color: const Color(0xFFFBC02D), width: 2),
           boxShadow: [BoxShadow(
-              color: const Color(0xFFFFD700).withOpacity(0.3),
-              blurRadius: 20, offset: const Offset(0, 6))],
+            color: const Color(0xFFFFD700).withOpacity(0.3),
+            blurRadius: 20, offset: const Offset(0, 6))],
         ),
         child: Column(children: [
-          // Header
           Padding(
             padding: const EdgeInsets.fromLTRB(20, 20, 20, 0),
             child: Row(children: [
               Container(width: 4, height: 24, color: const Color(0xFF8B0A1A)),
               const SizedBox(width: 12),
               const Text('Identity Authentication',
-                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.w900,
-                      color: Color(0xFF8B0A1A))),
+                style: TextStyle(fontSize: 20, fontWeight: FontWeight.w900,
+                    color: Color(0xFF8B0A1A))),
             ]),
           ),
-
           Expanded(child: SingleChildScrollView(
             padding: const EdgeInsets.all(16),
             child: Column(children: [
               _banner(),
               const SizedBox(height: 12),
-
               if (_session != null && _liveStatus == 'allowed') ...[
                 _teacherCard(),
                 const SizedBox(height: 12),
               ],
-
               _statusCard(),
               const SizedBox(height: 18),
-
               if (_showCamera && _camera != null && _cameraReady) ...[
                 _cameraCard(),
                 const SizedBox(height: 18),
               ],
-
               if (_showBtn)
                 _btn('Secure Face Unlock', Icons.face_unlock_outlined,
                     _liveStatus == 'allowed' && !_loading ? _start : null),
-
               if (_showRetry) ...[
                 const SizedBox(height: 10),
                 _outlineBtn('Try Again', _reset),
               ],
-
+              const SizedBox(height: 10),
+              _outlineBtn('View My Attendance', () {
+                Navigator.push(context, MaterialPageRoute(
+                  builder: (_) => const StudentViewAttendance()));
+              }),
               const SizedBox(height: 18),
               _securityCard(),
             ]),
@@ -769,40 +962,41 @@ class _State extends State<StudentAttendanceFragment>
     );
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // UI COMPONENTS
-  // ─────────────────────────────────────────────────────────────────────────
-
+  // ── UI components ────────────────────────────────────────────
   Widget _banner() {
     Color bg, border, tc; String label; IconData icon;
     switch (_liveStatus) {
       case 'allowed':
         bg = Colors.green.shade50; border = Colors.green.shade300;
-        tc = Colors.green.shade800; label = 'Attendance is OPEN — tap to mark';
-        icon = Icons.check_circle_outline; break;
+        tc = Colors.green.shade800;
+        label = 'Attendance is OPEN — tap to mark';
+        icon  = Icons.check_circle_outline; break;
       case 'stopped':
         bg = Colors.red.shade50; border = Colors.red.shade300;
         tc = Colors.red.shade800; label = 'Attendance is CLOSED';
-        icon = Icons.cancel_outlined; break;
+        icon  = Icons.cancel_outlined; break;
       case 'set':
         bg = Colors.orange.shade50; border = Colors.orange.shade300;
-        tc = Colors.orange.shade800; label = 'Session set — waiting for teacher to start';
-        icon = Icons.hourglass_top_outlined; break;
+        tc = Colors.orange.shade800;
+        label = 'Session set — waiting for teacher to start';
+        icon  = Icons.hourglass_top_outlined; break;
       default:
         bg = Colors.grey.shade100; border = Colors.grey.shade300;
-        tc = Colors.grey.shade700; label = 'No active session for your class';
-        icon = Icons.info_outline;
+        tc = Colors.grey.shade700;
+        label = 'No active session for your class';
+        icon  = Icons.info_outline;
     }
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-      decoration: BoxDecoration(color: bg, borderRadius: BorderRadius.circular(16),
+      decoration: BoxDecoration(color: bg,
+          borderRadius: BorderRadius.circular(16),
           border: Border.all(color: border)),
       child: Row(children: [
         Icon(icon, color: tc, size: 20),
         const SizedBox(width: 10),
-        Expanded(child: Text(label,
-            style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: tc))),
+        Expanded(child: Text(label, style: TextStyle(
+            fontWeight: FontWeight.bold, fontSize: 13, color: tc))),
       ]),
     );
   }
@@ -810,18 +1004,17 @@ class _State extends State<StudentAttendanceFragment>
   Widget _teacherCard() => Container(
     width: double.infinity,
     padding: const EdgeInsets.all(16),
-    decoration: BoxDecoration(
-      color: Colors.white, borderRadius: BorderRadius.circular(20),
-      border: Border.all(color: const Color(0xFFFBC02D), width: 1.5),
-    ),
+    decoration: BoxDecoration(color: Colors.white,
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: const Color(0xFFFBC02D), width: 1.5)),
     child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
       const Text('Active Attendance Session',
           style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold,
               color: Color(0xFF8B0A1A))),
       const SizedBox(height: 10),
-      _row(Icons.person_outline,       'Faculty', _session!.faculty),
+      _row(Icons.person_outline,       'Faculty',  _session!.faculty),
       const SizedBox(height: 6),
-      _row(Icons.book_outlined,        'Subject', _session!.subject),
+      _row(Icons.book_outlined,        'Subject',  _session!.subject),
       const SizedBox(height: 6),
       _row(Icons.school_outlined,      'Class',
           '${_session!.dept} · ${_session!.sem} · ${_session!.shift}'),
@@ -845,11 +1038,10 @@ class _State extends State<StudentAttendanceFragment>
   Widget _statusCard() => Container(
     width: double.infinity,
     padding: const EdgeInsets.all(22),
-    decoration: BoxDecoration(
-      color: Colors.white, borderRadius: BorderRadius.circular(24),
-      boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.05),
-          blurRadius: 10, offset: const Offset(0, 3))],
-    ),
+    decoration: BoxDecoration(color: Colors.white,
+        borderRadius: BorderRadius.circular(24),
+        boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.05),
+            blurRadius: 10, offset: const Offset(0, 3))]),
     child: Column(children: [
       if (_loading) ...[
         const SizedBox(width: 45, height: 45,
@@ -862,8 +1054,8 @@ class _State extends State<StudentAttendanceFragment>
               fontWeight: FontWeight.bold)),
       const SizedBox(height: 6),
       Text(_instruction, textAlign: TextAlign.center,
-          style: const TextStyle(color: Color(0xFF757575), fontSize: 13,
-              height: 1.5)),
+          style: const TextStyle(color: Color(0xFF757575),
+              fontSize: 13, height: 1.5)),
     ]),
   );
 
@@ -877,14 +1069,10 @@ class _State extends State<StudentAttendanceFragment>
     ),
     clipBehavior: Clip.antiAlias,
     child: Stack(fit: StackFit.expand, children: [
-      // Camera preview — safe guard
-      if (_camera != null && _cameraReady && (_camera?.value.isInitialized ?? false))
+      if (_camera != null && _cameraReady &&
+          (_camera?.value.isInitialized ?? false))
         CameraPreview(_camera!),
-
-      // Oval face guide
       CustomPaint(painter: _OvalPainter()),
-
-      // FIX 3: Torch toggle button
       if (_torchAvail)
         Positioned(top: 12, left: 12,
           child: GestureDetector(
@@ -899,14 +1087,10 @@ class _State extends State<StudentAttendanceFragment>
               ),
               child: Icon(
                 _torchOn ? Icons.flashlight_on : Icons.flashlight_off,
-                color: _torchOn ? Colors.black : Colors.white,
-                size: 22,
-              ),
+                color: _torchOn ? Colors.black : Colors.white, size: 22),
             ),
           ),
         ),
-
-      // Blink status badge
       Positioned(top: 12, right: 12,
         child: Container(
           padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
@@ -914,17 +1098,13 @@ class _State extends State<StudentAttendanceFragment>
             color: _blinkDetected
                 ? Colors.green.withOpacity(0.9)
                 : const Color(0xFFFF9800).withOpacity(0.9),
-            borderRadius: BorderRadius.circular(12),
-          ),
+            borderRadius: BorderRadius.circular(12)),
           child: Text(
             _blinkDetected ? '✅ BLINKED' : '👁 BLINK NOW',
-            style: const TextStyle(color: Colors.white, fontSize: 11,
-                fontWeight: FontWeight.bold),
-          ),
+            style: const TextStyle(color: Colors.white,
+                fontSize: 11, fontWeight: FontWeight.bold)),
         ),
       ),
-
-      // Bottom instruction bar
       Positioned(bottom: 0, left: 0, right: 0,
         child: Container(
           height: 50,
@@ -933,8 +1113,8 @@ class _State extends State<StudentAttendanceFragment>
           child: Text(
             _blinkDetected ? 'CAPTURING…' : 'BLINK ONCE TO VERIFY',
             style: const TextStyle(color: Colors.white,
-                fontWeight: FontWeight.bold, fontSize: 13, letterSpacing: 1.5),
-          ),
+                fontWeight: FontWeight.bold, fontSize: 13,
+                letterSpacing: 1.5)),
         ),
       ),
     ]),
@@ -958,44 +1138,46 @@ class _State extends State<StudentAttendanceFragment>
         '• Blink once when camera opens to confirm liveness.\n'
         '• Use the torch button if lighting is poor.\n'
         '• GPS verifies you are within the classroom radius.\n'
-        '• GPS accuracy is considered automatically — no need to go outside.',
+        '• GPS accuracy is considered automatically.',
         style: TextStyle(color: Color(0xFF616161), fontSize: 13, height: 1.7),
       ),
     ]),
   );
 
-  Widget _btn(String label, IconData icon, VoidCallback? onTap) => SizedBox(
-    width: double.infinity, height: 62,
-    child: ElevatedButton(
-      onPressed: onTap,
-      style: ElevatedButton.styleFrom(
-        backgroundColor: onTap == null
-            ? Colors.grey.shade400 : const Color(0xFF8B0A1A),
-        shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(30)),
-        elevation: onTap == null ? 0 : 8,
-      ),
-      child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-        Icon(icon, color: Colors.white, size: 22),
-        const SizedBox(width: 10),
-        Text(label, style: const TextStyle(color: Colors.white,
-            fontWeight: FontWeight.bold, fontSize: 16)),
-      ]),
-    ),
-  );
+  Widget _btn(String label, IconData icon, VoidCallback? onTap) =>
+      SizedBox(width: double.infinity, height: 62,
+        child: ElevatedButton(
+          onPressed: onTap,
+          style: ElevatedButton.styleFrom(
+            backgroundColor: onTap == null
+                ? Colors.grey.shade400 : const Color(0xFF8B0A1A),
+            shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(30)),
+            elevation: onTap == null ? 0 : 8,
+          ),
+          child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+            Icon(icon, color: Colors.white, size: 22),
+            const SizedBox(width: 10),
+            Text(label, style: const TextStyle(color: Colors.white,
+                fontWeight: FontWeight.bold, fontSize: 16)),
+          ]),
+        ),
+      );
 
-  Widget _outlineBtn(String label, VoidCallback onTap) => SizedBox(
-    width: double.infinity, height: 60,
-    child: OutlinedButton(
-      onPressed: onTap,
-      style: OutlinedButton.styleFrom(
-        side: const BorderSide(color: Color(0xFF8B0A1A), width: 2),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
-      ),
-      child: Text(label, style: const TextStyle(
-          color: Color(0xFF8B0A1A), fontWeight: FontWeight.bold, fontSize: 15)),
-    ),
-  );
+  Widget _outlineBtn(String label, VoidCallback onTap) =>
+      SizedBox(width: double.infinity, height: 60,
+        child: OutlinedButton(
+          onPressed: onTap,
+          style: OutlinedButton.styleFrom(
+            side: const BorderSide(color: Color(0xFF8B0A1A), width: 2),
+            shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(30)),
+          ),
+          child: Text(label, style: const TextStyle(
+              color: Color(0xFF8B0A1A), fontWeight: FontWeight.bold,
+              fontSize: 15)),
+        ),
+      );
 
   Widget _webScreen() => Scaffold(
     backgroundColor: Colors.transparent,
@@ -1004,8 +1186,7 @@ class _State extends State<StudentAttendanceFragment>
       decoration: BoxDecoration(
         color: const Color(0xFFFDF2F3),
         borderRadius: BorderRadius.circular(32),
-        border: Border.all(color: const Color(0xFFFBC02D), width: 2),
-      ),
+        border: Border.all(color: const Color(0xFFFBC02D), width: 2)),
       child: Column(children: [
         Padding(padding: const EdgeInsets.fromLTRB(20, 20, 20, 0),
           child: Row(children: [
@@ -1036,21 +1217,6 @@ class _State extends State<StudentAttendanceFragment>
               textAlign: TextAlign.center,
               style: TextStyle(fontSize: 15, color: Color(0xFF666666),
                   height: 1.6)),
-            const SizedBox(height: 28),
-            Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: const Color(0xFFFFF8E1),
-                borderRadius: BorderRadius.circular(16),
-                border: Border.all(color: const Color(0xFFFBC02D))),
-              child: const Row(children: [
-                Icon(Icons.info_outline, color: Color(0xFFF9A825)),
-                SizedBox(width: 10),
-                Expanded(child: Text(
-                  'Open Campus Pulse on your Android device to mark attendance.',
-                  style: TextStyle(fontSize: 13, color: Color(0xFF5D4037),
-                      height: 1.5))),
-              ])),
           ]),
         ))),
       ]),
@@ -1058,9 +1224,7 @@ class _State extends State<StudentAttendanceFragment>
   );
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// OVAL PAINTER
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Oval painter ─────────────────────────────────────────────
 class _OvalPainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
@@ -1072,7 +1236,6 @@ class _OvalPainter extends CustomPainter {
         ..style = PaintingStyle.stroke
         ..strokeWidth = 3.5,
     );
-    // Corner guides
     final p = Paint()
       ..color = Colors.white
       ..style = PaintingStyle.stroke
@@ -1080,10 +1243,10 @@ class _OvalPainter extends CustomPainter {
       ..strokeCap = StrokeCap.round;
     const rx = 95.0; const ry = 125.0;
     final cx = center.dx; final cy = center.dy;
-    canvas.drawLine(Offset(cx - rx, cy - ry + 20), Offset(cx - rx, cy - ry), p);
-    canvas.drawLine(Offset(cx - rx, cy - ry), Offset(cx - rx + 20, cy - ry), p);
-    canvas.drawLine(Offset(cx + rx - 20, cy - ry), Offset(cx + rx, cy - ry), p);
-    canvas.drawLine(Offset(cx + rx, cy - ry), Offset(cx + rx, cy - ry + 20), p);
+    canvas.drawLine(Offset(cx-rx, cy-ry+20), Offset(cx-rx, cy-ry), p);
+    canvas.drawLine(Offset(cx-rx, cy-ry), Offset(cx-rx+20, cy-ry), p);
+    canvas.drawLine(Offset(cx+rx-20, cy-ry), Offset(cx+rx, cy-ry), p);
+    canvas.drawLine(Offset(cx+rx, cy-ry), Offset(cx+rx, cy-ry+20), p);
   }
   @override bool shouldRepaint(_) => false;
 }

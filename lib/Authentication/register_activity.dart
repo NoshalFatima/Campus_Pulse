@@ -104,7 +104,7 @@ class _RegisterActivityState extends State<RegisterActivity> {
             children: [
               const SizedBox(height: 48),
               // App Logo
-              Image.asset('assets/logo1.png', width: 120, height: 120),
+              Image.asset('assets/logo1.jpeg', width: 120, height: 120),
               const SizedBox(height: 32),
 
               const Text(

@@ -2,9 +2,11 @@
 //
 // ✅ FIX 1: App closed → notification via OneSignal (works when net is on)
 // ✅ FIX 2: Beautiful announcement cards — fixed height, "Read More" expand
-// ✅ FIX 3: Mark as Read — stored in SharedPreferences locally
+// ✅ FIX 3: Mark as Read — stored in SharedPreferences locally (USER-SCOPED)
 // ✅ FIX 4: All toasts in professional English (SnackBar style)
 // ✅ FIX 5: Unread dot badge on each card
+// ✅ FIX 6: Read state is scoped per user — survives logout/login
+// ✅ FIX 7: Clear Notifications button — resets all read/unread state
 // ✅ NEW : Hive offline cache — loads cached announcements immediately,
 //          syncs from Firestore in background when online.
 //          Works fully offline after first load.
@@ -62,10 +64,25 @@ class _StudentAnnouncementFragmentState
 
   // ── Hive + announcements state ─────────────────────────────────────────────
   late Box<Announcement> _hiveBox;
-  List<Announcement> _cachedAnnouncements = [];   // shown immediately (offline)
-  List<Announcement> _liveAnnouncements = [];      // updated from Firestore
-  bool _isOnline = true;                           // track connectivity
+  List<Announcement> _cachedAnnouncements = [];
+  List<Announcement> _liveAnnouncements = [];
+  bool _isOnline = true;
   StreamSubscription<QuerySnapshot>? _firestoreSubscription;
+
+  // ── Helpers ────────────────────────────────────────────────────────────────
+
+  /// Returns a user-scoped SharedPreferences key so read state is
+  /// never shared between different accounts on the same device.
+  String get _readIdsKey {
+    final uid = FirebaseAuth.instance.currentUser?.uid ?? 'anonymous';
+    return 'read_announcements_$uid';
+  }
+
+  /// Key to persist which announcement IDs were cleared
+  String get _clearedIdsKey {
+    final uid = FirebaseAuth.instance.currentUser?.uid ?? 'anonymous';
+    return 'cleared_announcements_$uid';
+  }
 
   @override
   void initState() {
@@ -84,13 +101,13 @@ class _StudentAnnouncementFragmentState
   // ─────────────────────────────────────────────────────────────────────────
 
   Future<void> _initializeData() async {
-    await _openHiveBox();         // 1. open Hive — always works offline
-    await _loadFromHive();        // 2. load cached data immediately
-    await _loadReadIds();         // 3. read state from SharedPreferences
-    await _fetchStudentProfile(); // 4. get dept/sem/shift from Firestore/cache
+    await _openHiveBox();
+    await _loadFromHive();
+    await _loadReadIds();           // ← now user-scoped
+    await _fetchStudentProfile();
     await _setOneSignalTags();
     await _setupFCMListener();
-    _startFirestoreSync();        // 5. subscribe to live Firestore updates
+    _startFirestoreSync();
 
     if (!kIsWeb && myDept.isNotEmpty) {
       await AnnouncementListenerService.init();
@@ -115,22 +132,19 @@ class _StudentAnnouncementFragmentState
       debugPrint("✅ Hive box opened: ${_hiveBox.length} cached items");
     } catch (e) {
       debugPrint("❌ Hive open error: $e");
-      // Fallback: open a fresh box if corrupt
       await Hive.deleteBoxFromDisk(_kAnnouncementsBox);
       _hiveBox = await Hive.openBox<Announcement>(_kAnnouncementsBox);
     }
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  // HIVE — LOAD CACHED ANNOUNCEMENTS (instant, works offline)
+  // HIVE — LOAD CACHED ANNOUNCEMENTS
   // ─────────────────────────────────────────────────────────────────────────
 
   Future<void> _loadFromHive() async {
     try {
       final cached = _hiveBox.values.toList();
-      // Sort by date descending (newest first) — same order as Firestore
       cached.sort((a, b) => b.date.compareTo(a.date));
-
       if (mounted) {
         setState(() {
           _cachedAnnouncements = cached;
@@ -149,7 +163,7 @@ class _StudentAnnouncementFragmentState
 
   Future<void> _saveToHive(List<Announcement> announcements) async {
     try {
-      await _hiveBox.clear(); // replace with fresh data
+      await _hiveBox.clear();
       final Map<String, Announcement> entries = {
         for (final a in announcements) a.id: a,
       };
@@ -174,31 +188,32 @@ class _StudentAnnouncementFragmentState
         if (!mounted) return;
 
         final all = snapshot.docs
-            .map((doc) =>
-                Announcement.fromMap(doc.data()))
+            .map((doc) => Announcement.fromMap(doc.data()))
             .toList();
 
-        // Persist to Hive for offline access
-        await _saveToHive(all);
+        // Filter out permanently cleared announcements
+        // Only show ones that are NOT in _clearedIds
+        final visible = _clearedIds.isEmpty
+            ? all
+            : all.where((a) => !_clearedIds.contains(a.id)).toList();
 
+        await _saveToHive(visible);
         if (mounted) {
           setState(() {
-            _liveAnnouncements = all;
+            _liveAnnouncements = visible;
             _isOnline = true;
           });
         }
       },
       onError: (e) {
         debugPrint("⚠️ Firestore stream error (offline?): $e");
-        if (mounted) {
-          setState(() => _isOnline = false);
-        }
+        if (mounted) setState(() => _isOnline = false);
       },
     );
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  // HELPERS — Get the best available list (live > cache)
+  // HELPERS
   // ─────────────────────────────────────────────────────────────────────────
 
   List<Announcement> get _activeAnnouncements =>
@@ -222,20 +237,28 @@ class _StudentAnnouncementFragmentState
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  // READ STATE
+  // READ STATE  (user-scoped — FIX for login persistence)
   // ─────────────────────────────────────────────────────────────────────────
 
   Future<void> _loadReadIds() async {
     final prefs = await SharedPreferences.getInstance();
-    final List<String> ids = prefs.getStringList('read_announcements') ?? [];
+    // Key includes the UID so different users on the same device
+    // never share or override each other's read state.
+    final List<String> ids = prefs.getStringList(_readIdsKey) ?? [];
     if (mounted) setState(() => _readIds = ids.toSet());
+  }
+
+  Future<void> _loadClearedIds() async {
+    final prefs = await SharedPreferences.getInstance();
+    final ids = prefs.getStringList(_clearedIdsKey) ?? [];
+    if (mounted) setState(() => _clearedIds = ids.toSet());
   }
 
   Future<void> _markAsRead(String id) async {
     if (_readIds.contains(id)) return;
     setState(() => _readIds.add(id));
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setStringList('read_announcements', _readIds.toList());
+    await prefs.setStringList(_readIdsKey, _readIds.toList());
   }
 
   Future<void> _markAllAsRead(List<Announcement> list) async {
@@ -243,9 +266,79 @@ class _StudentAnnouncementFragmentState
     for (final a in list) {
       _readIds.add(a.id);
     }
-    await prefs.setStringList('read_announcements', _readIds.toList());
+    await prefs.setStringList(_readIdsKey, _readIds.toList());
     if (mounted) setState(() {});
     _showSnack("All announcements marked as read.");
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // CLEAR NOTIFICATIONS  (resets all read state for this user)
+  // ─────────────────────────────────────────────────────────────────────────
+
+  // ── Cleared IDs — persisted in SharedPreferences so they survive navigation ──
+  Set<String> _clearedIds = {};
+
+  Future<void> _clearNotifications() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Text(
+          "Clear Notifications",
+          style: TextStyle(
+            fontWeight: FontWeight.bold,
+            fontSize: 16,
+            color: Color(0xFF8B0A1A),
+          ),
+        ),
+        content: const Text(
+          "All announcements will be removed from this screen. They will reappear when new ones are posted.",
+          style: TextStyle(fontSize: 13.5),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text("Cancel",
+                style: TextStyle(color: Colors.grey)),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFF8B0A1A),
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(10)),
+            ),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text("Clear",
+                style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true) return;
+
+    // Mark all current IDs as "read" so they won't reappear as unread
+    final allIds = _activeAnnouncements.map((a) => a.id).toList();
+    final prefs = await SharedPreferences.getInstance();
+    for (final id in allIds) _readIds.add(id);
+    await prefs.setStringList(_readIdsKey, _readIds.toList());
+
+    // Wipe Hive cache
+    await _hiveBox.clear();
+
+    // Persist cleared IDs so they survive navigation and app restarts
+    final prefs2 = await SharedPreferences.getInstance();
+    for (final id in allIds) _clearedIds.add(id);
+    await prefs2.setStringList(_clearedIdsKey, _clearedIds.toList());
+
+    if (mounted) {
+      setState(() {
+        _cachedAnnouncements = [];
+        _liveAnnouncements = [];
+        _expandedIds.clear();
+      });
+    }
+    _showSnack("Notifications cleared.");
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -279,7 +372,6 @@ class _StudentAnnouncementFragmentState
         if (mounted) setState(() => isLoadingProfile = false);
       }
     } catch (e) {
-      // Offline — profile fetch may fail; cached announcements already showing
       debugPrint("⚠️ Profile fetch error (offline?): $e");
       if (mounted) setState(() => isLoadingProfile = false);
     }
@@ -381,7 +473,6 @@ class _StudentAnnouncementFragmentState
   @override
   Widget build(BuildContext context) {
     if (isLoadingProfile && _cachedAnnouncements.isEmpty) {
-      // Only show full-screen loader if we have nothing to show yet
       return const Center(
         child: CircularProgressIndicator(color: Color(0xFF8B0A1A)),
       );
@@ -395,7 +486,7 @@ class _StudentAnnouncementFragmentState
       backgroundColor: Colors.transparent,
       body: Container(
         width: double.infinity,
-        margin: const EdgeInsets.fromLTRB(15, 25, 15, 60),
+        margin: const EdgeInsets.fromLTRB(15, 27, 15, 60),
         decoration: BoxDecoration(
           color: const Color(0xFFFDF2F3),
           borderRadius: BorderRadius.circular(30),
@@ -404,21 +495,45 @@ class _StudentAnnouncementFragmentState
         child: Column(
           children: [
             // ── Header ───────────────────────────────────────────────────
-            const Padding(
-              padding: EdgeInsets.fromLTRB(20, 20, 20, 0),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 20, 20, 0),
               child: Row(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
-                  Icon(Icons.campaign_rounded,
+                  const Icon(Icons.campaign_rounded,
                       size: 28, color: Color(0xFF8B0A1A)),
-                  SizedBox(width: 8),
-                  Text(
-                    "CAMPUS UPDATES",
-                    style: TextStyle(
-                      fontWeight: FontWeight.bold,
-                      fontSize: 17,
-                      color: Color(0xFF8B0A1A),
-                      letterSpacing: 1.2,
+                  const SizedBox(width: 8),
+                  const Expanded(
+                    child: Text(
+                      "CAMPUS UPDATES",
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                        fontSize: 17,
+                        color: Color(0xFF8B0A1A),
+                        letterSpacing: 1.2,
+                      ),
+                    ),
+                  ),
+                  // ── Clear Notifications button ─────────────────────────
+                  Tooltip(
+                    message: "Clear notification history",
+                    child: InkWell(
+                      borderRadius: BorderRadius.circular(10),
+                      onTap: _clearNotifications,
+                      child: Container(
+                        padding: const EdgeInsets.all(8),
+                        decoration: BoxDecoration(
+                          color: Colors.white,
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(
+                              color: Colors.red.shade200, width: 1.5),
+                          boxShadow: const [
+                            BoxShadow(color: Colors.black12, blurRadius: 4)
+                          ],
+                        ),
+                        child: Icon(Icons.notifications_off_outlined,
+                            color: Colors.red.shade400, size: 18),
+                      ),
                     ),
                   ),
                 ],
@@ -587,8 +702,7 @@ class _StudentAnnouncementFragmentState
           items: filters
               .map((f) => DropdownMenuItem(
                   value: f,
-                  child:
-                      Text(f, style: const TextStyle(fontSize: 13))))
+                  child: Text(f, style: const TextStyle(fontSize: 13))))
               .toList(),
           onChanged: (v) => setState(() => selectedFilter = v!),
         ),

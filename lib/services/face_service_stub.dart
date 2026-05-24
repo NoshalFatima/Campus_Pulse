@@ -1,27 +1,15 @@
 // lib/services/face_service_stub.dart
-// Web only — no TFLite available, returns zeros silently
+//
+// WEB STUB — loaded when dart:io is NOT available (web).
+// No tflite_flutter import — avoids dart:ffi error on web.
 
-import 'dart:async';
-
-class Interpreter {
-  void close() {}
-  void run(Object input, Object output) {
-    // Fill output[0] with zeros — web cannot do real inference
-    if (output is List && output.isNotEmpty && output[0] is List<double>) {
-      final inner = output[0] as List<double>;
-      for (int i = 0; i < inner.length; i++) inner[i] = 0.0;
-    }
-  }
-}
-
-class InterpreterOptions {
-  int threads = 1;
-}
+import 'dart:typed_data';
 
 Future<dynamic> delegateInterpreterFromAsset(String path, int threads) async {
-  return Interpreter();
+  // Web has no TFLite — return null, FaceService handles it
+  return null;
 }
 
 void delegateRunInterpreter(dynamic interpreter, Object input, Object output) {
-  (interpreter as Interpreter).run(input, output);
+  // No-op on web
 }

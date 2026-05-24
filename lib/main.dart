@@ -1,43 +1,39 @@
-// ✅ lib/main.dart — OFFLINE-SAFE VERSION
+// lib/main.dart
 //
-// ROOT CAUSE FIX: App was blocking on network calls before runApp().
-// Firebase, FCM, OneSignal all need internet. Without it, startup hanged.
-//
-// SOLUTION:
-//  1. runApp() is called IMMEDIATELY after Hive + Firebase.initializeApp()
-//     (initializeApp() uses cached config — works offline)
-//  2. ALL network-dependent calls (FCM permissions, topics, OneSignal)
-//     are moved to a background Future that runs AFTER the UI is visible
-//  3. Firestore/RTDB persistence set before any network touch
-//  4. _saveOneSignalIdToFirestore moved inside class (no stray top-level fn)
+// CHANGES FROM PREVIOUS VERSION:
+//   ✅ Removed _saveOneSignalIdToFirestore() — now handled inside OneSignalService
+//   ✅ _initNetworkServices() is clean — no Firestore calls here
+//   ✅ OneSignalService.initialize() called on mobile only (already guarded inside)
+//   ✅ Web FCM permission + onMessage listener kept as-is (was already working)
+//   ✅ runApp() still fires immediately — no blocking on network
 
-
-
-
-
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
-import 'package:flutter/foundation.dart' show kIsWeb;
-import 'package:onesignal_flutter/onesignal_flutter.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 import 'package:firebase_database/firebase_database.dart';
 import 'models/announcement_model.dart';
 import 'services/notification_service.dart';
+import 'services/onesignal_service.dart';
 import 'Faculty/FacultyDashboard.dart';
 import 'launcher_activity.dart';
-import 'dart:js' as js;
-import '../Authentication/login_activity.dart';
+import 'Authentication/login_activity.dart';
 import 'Authentication/register_activity.dart';
 import 'Authentication/reset_password_activity.dart';
 import 'Student/Student_Dashboard.dart';
 import '../chat/users_list_fragment.dart';
 import 'Faculty/AnnouncementScreen.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
+import '../Student/studentsignupactivity.dart';
+import '../Faculty/FacultyDashboard.dart';
+import 'Faculty/FacultySignupActivity.dart';
+import 'Student/student_view_attendance.dart';
+
 // ─────────────────────────────────────────────────────────────────────────────
-// BACKGROUND FCM HANDLER (must be top-level)
+// BACKGROUND FCM HANDLER — must be top-level function
 // ─────────────────────────────────────────────────────────────────────────────
 @pragma('vm:entry-point')
 Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
@@ -45,73 +41,72 @@ Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MAIN — only blocking work here: Hive + Firebase.initializeApp()
-// Everything else runs in background after UI is shown
+// MAIN
 // ─────────────────────────────────────────────────────────────────────────────
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // ── 1. HIVE (local, no network needed) ────────────────────────────────────
+  // ── 1. HIVE — local, no network ───────────────────────────────────────────
   await Hive.initFlutter();
   Hive.registerAdapter(AnnouncementAdapter());
   await Hive.openBox('dashboard_cache');
   await Hive.openBox('auth_cache');
   await Hive.openBox('settings');
   await dotenv.load(fileName: ".env");
-  // ── 2. FIREBASE CORE INIT ─────────────────────────────────────────────────
-  // This reads the local google-services.json / Firebase options.
-  // It does NOT require internet — safe to await.
+
+  // ── 2. FIREBASE CORE ──────────────────────────────────────────────────────
   await Firebase.initializeApp(
     options: kIsWeb
-    ? FirebaseOptions(
-        apiKey: dotenv.env['FIREBASE_WEB_API_KEY'] ?? '',
-        authDomain: dotenv.env['FIREBASE_WEB_AUTH_DOMAIN'] ?? '',
-        databaseURL: dotenv.env['FIREBASE_WEB_DATABASE_URL'] ?? '',
-        projectId: dotenv.env['FIREBASE_WEB_PROJECT_ID'] ?? '',
-        storageBucket: dotenv.env['FIREBASE_WEB_STORAGE_BUCKET'] ?? '',
-        messagingSenderId: dotenv.env['FIREBASE_WEB_MESSAGING_SENDER_ID'] ?? '',
-        appId: dotenv.env['FIREBASE_WEB_APP_ID'] ?? '',
-        measurementId: dotenv.env['FIREBASE_WEB_MEASUREMENT_ID'] ?? '',
-      )
-    : null,
+        ? FirebaseOptions(
+            apiKey           : dotenv.env['FIREBASE_WEB_API_KEY']            ?? '',
+            authDomain       : dotenv.env['FIREBASE_WEB_AUTH_DOMAIN']        ?? '',
+            databaseURL      : dotenv.env['FIREBASE_WEB_DATABASE_URL']       ?? '',
+            projectId        : dotenv.env['FIREBASE_WEB_PROJECT_ID']         ?? '',
+            storageBucket    : dotenv.env['FIREBASE_WEB_STORAGE_BUCKET']     ?? '',
+            messagingSenderId: dotenv.env['FIREBASE_WEB_MESSAGING_SENDER_ID'] ?? '',
+            appId            : dotenv.env['FIREBASE_WEB_APP_ID']             ?? '',
+            measurementId    : dotenv.env['FIREBASE_WEB_MEASUREMENT_ID']     ?? '',
+          )
+        : null,
   );
-String webOneSignalId = dotenv.env['ONESIGNAL_APP_ID'] ?? '';
-  js.context['onesignalAppId'] = webOneSignalId;
-  // ── 3. OFFLINE PERSISTENCE — set BEFORE any Firestore/RTDB reads ──────────
-  // These are local SDK settings, no network needed.
+
+  // ── 3. OFFLINE PERSISTENCE ────────────────────────────────────────────────
   if (!kIsWeb) {
     FirebaseDatabase.instance.setPersistenceEnabled(true);
     FirebaseDatabase.instance.setLoggingEnabled(false);
     FirebaseFirestore.instance.settings = const Settings(
-      persistenceEnabled: true,
-      cacheSizeBytes: Settings.CACHE_SIZE_UNLIMITED,
+      persistenceEnabled : true,
+      cacheSizeBytes     : Settings.CACHE_SIZE_UNLIMITED,
     );
   }
 
   // ── 4. SHOW UI IMMEDIATELY ────────────────────────────────────────────────
   runApp(const MyApp());
 
-  // ── 5. NETWORK-DEPENDENT SETUP — runs in background, won't block UI ───────
-  // Use Future.microtask so UI gets its first frame before we do anything else.
+  // ── 5. NETWORK SERVICES — deferred so UI is never blocked ─────────────────
   Future.microtask(() => _initNetworkServices());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ALL NETWORK SERVICES — called after runApp(), fully non-blocking
-// Each section is try-catched individually so one failure can't block others
+// NETWORK SERVICES INIT
 // ─────────────────────────────────────────────────────────────────────────────
 Future<void> _initNetworkServices() async {
-  // ── FCM (mobile only) ─────────────────────────────────────────────────────
+
   if (!kIsWeb) {
+    // ── MOBILE ──────────────────────────────────────────────────────────────
+
+    // FCM background handler
+    FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
+
+    // Local notification service (shows banner inside app)
     try {
-      FirebaseMessaging.onBackgroundMessage(_firebaseMessagingBackgroundHandler);
       await NotificationService.init();
       debugPrint("✅ NotificationService initialized");
     } catch (e) {
       debugPrint("❌ NotificationService init error: $e");
     }
 
-    // FCM permission — may show a system dialog, safe to do post-UI
+    // FCM permission
     try {
       final settings = await FirebaseMessaging.instance
           .requestPermission(alert: true, badge: true, sound: true)
@@ -121,7 +116,7 @@ Future<void> _initNetworkServices() async {
       debugPrint("❌ FCM permission error (offline?): $e");
     }
 
-    // FCM foreground listener
+    // FCM foreground listener — shows in-app notification banner
     try {
       FirebaseMessaging.onMessage.listen((RemoteMessage message) {
         debugPrint("📨 Foreground FCM: ${message.notification?.title}");
@@ -133,7 +128,7 @@ Future<void> _initNetworkServices() async {
       debugPrint("❌ FCM onMessage setup error: $e");
     }
 
-    // FCM topic — needs internet, safe to fail silently
+    // FCM topic subscription
     try {
       await FirebaseMessaging.instance
           .subscribeToTopic("all_campus")
@@ -143,37 +138,18 @@ Future<void> _initNetworkServices() async {
       debugPrint("❌ FCM topic error (offline?): $e");
     }
 
-    // ── OneSignal (mobile only) ──────────────────────────────────────────────
+    // OneSignal — mobile SDK
+    // Sub ID saving is now fully handled inside OneSignalService via observer
     try {
-      OneSignal.Debug.setLogLevel(OSLogLevel.verbose);
-      OneSignal.initialize(dotenv.env['ONESIGNAL_APP_ID'] ?? '');
-      
-      await OneSignal.Notifications.requestPermission(true)
-          .timeout(const Duration(seconds: 10));
-
-      OneSignal.User.pushSubscription.optIn();
-
-      OneSignal.User.pushSubscription.addObserver((state) {
-        final id    = state.current.id;
-        final token = state.current.token;
-        debugPrint("🔍 OneSignal — optedIn: ${state.current.optedIn}, token: $token, id: $id");
-        if (id != null && id.isNotEmpty) {
-          _saveOneSignalIdToFirestore(id);
-        }
-      });
-
-      // Check if ID already available (app restart case)
-      final currentId = OneSignal.User.pushSubscription.id;
-      if (currentId != null && currentId.isNotEmpty) {
-        _saveOneSignalIdToFirestore(currentId);
-      }
-
-      debugPrint("✅ OneSignal initialized");
+      await OneSignalService.initialize();
     } catch (e) {
-      debugPrint("❌ OneSignal init error (offline?): $e");
+      debugPrint("❌ OneSignal init error: $e");
     }
+
   } else {
-    // Web: FCM permission only (no OneSignal)
+    // ── WEB ─────────────────────────────────────────────────────────────────
+
+    // FCM web — handles browser push notifications
     try {
       final settings = await FirebaseMessaging.instance
           .requestPermission(alert: true, badge: true, sound: true)
@@ -187,31 +163,8 @@ Future<void> _initNetworkServices() async {
       debugPrint("❌ FCM web permission error (offline?): $e");
     }
 
-    debugPrint("ℹ️ OneSignal: Web mode — REST API used for notifications");
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SAVE ONESIGNAL ID TO FIRESTORE
-// ─────────────────────────────────────────────────────────────────────────────
-Future<void> _saveOneSignalIdToFirestore(String osId) async {
-  try {
-    final user = FirebaseAuth.instance.currentUser;
-    if (user != null) {
-      await FirebaseFirestore.instance
-          .collection('Users')
-          .doc(user.uid)
-          .set({
-        'oneSignalId': osId,
-        'lastUpdated': FieldValue.serverTimestamp(),
-      }, SetOptions(merge: true))
-          .timeout(const Duration(seconds: 10));
-      debugPrint("✅ OneSignal ID saved to Firestore: $osId");
-    } else {
-      debugPrint("ℹ️ Not logged in — OneSignal ID will be saved on next login.");
-    }
-  } catch (e) {
-    debugPrint("❌ Error saving OneSignal ID: $e");
+    // OneSignal web — SDK not available, REST API used for all sends
+    debugPrint("ℹ️ OneSignal Web: REST API active for sending notifications");
   }
 }
 
@@ -229,20 +182,23 @@ class MyApp extends StatelessWidget {
       theme: ThemeData(
         primaryColor: const Color(0xFF8B0A1A),
         colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFF8B0A1A),
-          primary: const Color(0xFF8B0A1A),
+          seedColor : const Color(0xFF8B0A1A),
+          primary   : const Color(0xFF8B0A1A),
         ),
         scaffoldBackgroundColor: const Color(0xFFFDF7F7),
       ),
       home: const LauncherActivity(),
       routes: {
-        '/login':                 (context) => const LoginActivity(),
-        '/register':              (context) => const RegisterActivity(),
-        '/reset_password':        (context) => const ResetPasswordActivity(),
-        '/faculty_dashboard':     (context) => const FacultyDashBoard(),
-        '/student_dashboard':     (context) => const StudentDashboard(),
-        '/users_list_fragment':   (context) => const UsersListFragment(),
-        '/faculty_announcement':  (context) => const AnnouncementFragment(),
+        '/login'                  : (context) => const LoginActivity(),
+        '/register'               : (context) => const RegisterActivity(),
+        '/reset_password'         : (context) => const ResetPasswordActivity(),
+        '/faculty_dashboard'      : (context) => const FacultyDashBoard(),
+        '/student_dashboard'      : (context) => const StudentDashboard(),
+        '/users_list_fragment'    : (context) => const UsersListFragment(),
+        '/faculty_announcement'   : (context) => const AnnouncementFragment(),
+        '/studentsignupactivity'  : (context) => const StudentSignupActivity(),
+        '/faculty_signup'         : (context) => const FacultySignupActivity(),
+        '/student_view_attendance': (context) => const StudentViewAttendance(),
       },
     );
   }

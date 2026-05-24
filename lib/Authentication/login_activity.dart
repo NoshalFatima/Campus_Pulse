@@ -2,7 +2,10 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:onesignal_flutter/onesignal_flutter.dart';
+
+// ✅ Only OneSignalService — no direct onesignal_flutter import needed here
+import '../services/onesignal_service.dart';
+
 class LoginActivity extends StatefulWidget {
   const LoginActivity({super.key});
 
@@ -11,20 +14,22 @@ class LoginActivity extends StatefulWidget {
 }
 
 class _LoginActivityState extends State<LoginActivity> {
-  // Controllers
-  final TextEditingController _emailController = TextEditingController();
+  final TextEditingController _emailController    = TextEditingController();
   final TextEditingController _passwordController = TextEditingController();
 
-  // Firebase instances
-  final FirebaseAuth _auth = FirebaseAuth.instance;
-  final FirebaseFirestore _db = FirebaseFirestore.instance;
+  final FirebaseAuth      _auth = FirebaseAuth.instance;
+  final FirebaseFirestore _db   = FirebaseFirestore.instance;
 
   bool _obscurePassword = true;
-  bool _isLoading = false;
+  bool _isLoading       = false;
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // HANDLE LOGIN
+  // ─────────────────────────────────────────────────────────────────────────
 
   Future<void> _handleLogin() async {
-    String email = _emailController.text.trim();
-    String password = _passwordController.text.trim();
+    final email    = _emailController.text.trim();
+    final password = _passwordController.text.trim();
 
     if (email.isEmpty || password.isEmpty) {
       _showToast("Please fill all fields");
@@ -34,93 +39,83 @@ class _LoginActivityState extends State<LoginActivity> {
     setState(() => _isLoading = true);
 
     try {
-      // 1. Sign In
-      UserCredential userCredential = await _auth.signInWithEmailAndPassword(
-        email: email,
+      // 1. Firebase sign-in
+      final userCredential = await _auth.signInWithEmailAndPassword(
+        email   : email,
         password: password,
       );
 
       User? user = userCredential.user;
-
-      if (user != null) {
-        // 2. Reload user for latest verification status
-        await user.reload();
-        user = _auth.currentUser;
-
-        if (user != null && !user.emailVerified) {
-          _showToast("Please verify your email first.");
-          await _auth.signOut();
-          setState(() => _isLoading = false);
-        } else {
-          // 3. Check Role in Firestore
-          _checkUserRoleAndRedirect(user!.uid);
-        }
+      if (user == null) {
+        setState(() => _isLoading = false);
+        return;
       }
+
+      // 2. Reload for latest email verification status
+      await user.reload();
+      user = _auth.currentUser;
+
+      if (user == null) {
+        setState(() => _isLoading = false);
+        return;
+      }
+
+      if (!user.emailVerified) {
+        _showToast("Please verify your email first.");
+        await _auth.signOut();
+        setState(() => _isLoading = false);
+        return;
+      }
+
+      // 3. ✅ OneSignal login — right after Firebase sign-in, before navigation
+      //    Mobile: links device to Firebase UID → sub ID saves to Firestore via observer
+      //    Web:    early return inside service (REST API handles everything)
+      await OneSignalService.loginUser(user.uid);
+
+      // 4. Check role and navigate
+      await _checkUserRoleAndRedirect(user.uid);
+
     } on FirebaseAuthException catch (e) {
       setState(() => _isLoading = false);
       _showToast("Error: ${e.message}");
     }
   }
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // ROLE CHECK + REDIRECT
+  // ─────────────────────────────────────────────────────────────────────────
+
   Future<void> _checkUserRoleAndRedirect(String uid) async {
     try {
-      DocumentSnapshot doc = await _db.collection("Users").doc(uid).get();
+      final doc = await _db.collection("Users").doc(uid).get();
 
       setState(() => _isLoading = false);
 
-     if (doc.exists) {
-  String? oneSignalId;
-
-  // ✅ CHECK IF RUNNING ON WEB OR MOBILE
-  if (!kIsWeb) {
-    try {
-      // Mobile logic: SDK se ID nikalne ki koshish karein
-      await OneSignal.login(uid); 
-      oneSignalId = OneSignal.User.pushSubscription.id;
-
-      // Retry logic for Mobile (Wait for ID)
-      int retryCount = 0;
-      while ((oneSignalId == null || oneSignalId.isEmpty) && retryCount < 3) {
-        await Future.delayed(const Duration(seconds: 1));
-        oneSignalId = OneSignal.User.pushSubscription.id;
-        retryCount++;
+      if (!doc.exists) {
+        _showToast("User data not found.");
+        return;
       }
-    } catch (e) {
-      print("OneSignal Mobile error: $e");
-    }
-  } else {
-    // ✅ WEB LOGIC: SDK ko skip karein taaki crash na ho
-    oneSignalId = "WEB_USER"; // Ya aap khali chorna chahen to "" rakh den
-    print("ℹ️ Web detected: OneSignal ID set to $oneSignalId");
-  }
-// ✅ SAVE TO FIRESTORE
-await _db.collection("Users").doc(uid).update({
-  "oneSignalId": oneSignalId ?? "",
-});
-        String? role = doc.get("role");
-        String routeName = "";
 
-        if (role?.toLowerCase() == "teacher") {
-          // CNIC check for Teacher
-          if (doc.data().toString().contains('cnic') && doc.get('cnic') != null) {
-            routeName = '/faculty_dashboard';
-          } else {
-            routeName = '/faculty_signup';
-          }
-        } else if (role?.toLowerCase() == "student") {
-          // regNo check for Student
-          if (doc.data().toString().contains('regNo') && doc.get('regNo') != null) {
-            routeName = '/student_dashboard';
-          } else {
-            routeName = '/student_signup';
-          }
-        }
+      final data = doc.data() ?? {};
+      final role = (data['role'] as String?)?.toLowerCase() ?? '';
 
-        if (routeName.isNotEmpty) {
-          Navigator.pushNamedAndRemoveUntil(context, routeName, (route) => false);
-        } else {
-          _showToast("Role not recognized.");
-        }
+      String routeName = '';
+
+      if (role == 'teacher') {
+        routeName = (data['cnic'] != null && data['cnic'].toString().isNotEmpty)
+            ? '/faculty_dashboard'
+            : '/faculty_signup';
+      } else if (role == 'student') {
+        routeName = (data['regNo'] != null && data['regNo'].toString().isNotEmpty)
+            ? '/student_dashboard'
+            : '/studentsignupactivity';
+      }
+
+      if (routeName.isNotEmpty) {
+        if (!mounted) return;
+        Navigator.pushNamedAndRemoveUntil(context, routeName, (route) => false);
+      } else {
+        _showToast("Role not recognized.");
       }
     } catch (e) {
       setState(() => _isLoading = false);
@@ -128,14 +123,28 @@ await _db.collection("Users").doc(uid).update({
     }
   }
 
+  // ─────────────────────────────────────────────────────────────────────────
+
   void _showToast(String message) {
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(message)));
   }
+
+  @override
+  void dispose() {
+    _emailController.dispose();
+    _passwordController.dispose();
+    super.dispose();
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // BUILD
+  // ─────────────────────────────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFFFDF2F3), // XML Background
+      backgroundColor: const Color(0xFFFDF2F3),
       body: SingleChildScrollView(
         child: Padding(
           padding: const EdgeInsets.all(32.0),
@@ -143,74 +152,50 @@ await _db.collection("Users").doc(uid).update({
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
               const SizedBox(height: 48),
-              // App Logo
-              Image.asset(
-                'assets/logo1.jpeg',
-                width: 120,
-                height: 120,
-              ),
+
+              Image.asset('assets/logo1.jpeg', width: 120, height: 120),
+
               const SizedBox(height: 32),
-              // Login Text
+
               const Text(
                 "Login",
                 style: TextStyle(
-                  fontSize: 32,
-                  fontWeight: FontWeight.bold,
-                  color: Color(0xFF8B0A1A), // Maroon
+                  fontSize      : 32,
+                  fontWeight    : FontWeight.bold,
+                  color         : Color(0xFF8B0A1A),
                 ),
               ),
+
               const SizedBox(height: 32),
 
-              // Email Input
+              // Email
               TextField(
-                controller: _emailController,
+                controller  : _emailController,
                 keyboardType: TextInputType.emailAddress,
-                decoration: InputDecoration(
-                  hintText: "Email",
-                  filled: true,
-                  fillColor: Colors.white,
-                  enabledBorder: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(8),
-                    borderSide: const BorderSide(color: Color(0xFF8B0A1A)),
-                  ),
-                  focusedBorder: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(8),
-                    borderSide: const BorderSide(color: Color(0xFF8B0A1A), width: 2),
-                  ),
-                ),
+                decoration  : _inputDecoration("Email"),
               ),
+
               const SizedBox(height: 16),
 
-              // Password Input
+              // Password
               TextField(
-                controller: _passwordController,
+                controller : _passwordController,
                 obscureText: _obscurePassword,
-                decoration: InputDecoration(
-                  hintText: "Password",
-                  filled: true,
-                  fillColor: Colors.white,
+                decoration : _inputDecoration("Password").copyWith(
                   suffixIcon: IconButton(
                     icon: Icon(
                       _obscurePassword ? Icons.visibility_off : Icons.visibility,
                       color: const Color(0xFF8B0A1A),
                     ),
-                    onPressed: () {
-                      setState(() => _obscurePassword = !_obscurePassword);
-                    },
-                  ),
-                  enabledBorder: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(8),
-                    borderSide: const BorderSide(color: Color(0xFF8B0A1A)),
-                  ),
-                  focusedBorder: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(8),
-                    borderSide: const BorderSide(color: Color(0xFF8B0A1A), width: 2),
+                    onPressed: () =>
+                        setState(() => _obscurePassword = !_obscurePassword),
                   ),
                 ),
               ),
+
               const SizedBox(height: 32),
 
-              // Login Button
+              // Login button
               SizedBox(
                 width: double.infinity,
                 child: ElevatedButton(
@@ -219,41 +204,38 @@ await _db.collection("Users").doc(uid).update({
                     backgroundColor: const Color(0xFF8B0A1A),
                     padding: const EdgeInsets.symmetric(vertical: 14),
                     shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(8),
-                    ),
+                        borderRadius: BorderRadius.circular(8)),
                   ),
                   child: _isLoading
                       ? const CircularProgressIndicator(color: Colors.white)
-                      : const Text(
-                      "Login",
-                      style: TextStyle(fontSize: 18, color: Colors.white)
-                  ),
+                      : const Text("Login",
+                          style: TextStyle(fontSize: 18, color: Colors.white)),
                 ),
               ),
 
               const SizedBox(height: 24),
-              // Register Link
+
               GestureDetector(
                 onTap: () => Navigator.pushNamed(context, '/register'),
                 child: const Text(
                   "Don't have an account? Register",
                   style: TextStyle(
-                    color: Color(0xFF8B0A1A),
-                    fontSize: 16,
+                    color     : Color(0xFF8B0A1A),
+                    fontSize  : 16,
                     fontWeight: FontWeight.bold,
                   ),
                 ),
               ),
 
               const SizedBox(height: 24),
-              // Reset Password Link
+
               GestureDetector(
                 onTap: () => Navigator.pushNamed(context, '/reset_password'),
                 child: const Text(
                   "Forget Password🙁",
                   style: TextStyle(
-                    color: Color(0xFF8B0A1A),
-                    fontSize: 16,
+                    color     : Color(0xFF8B0A1A),
+                    fontSize  : 16,
                     fontWeight: FontWeight.bold,
                   ),
                 ),
@@ -261,6 +243,22 @@ await _db.collection("Users").doc(uid).update({
             ],
           ),
         ),
+      ),
+    );
+  }
+
+  InputDecoration _inputDecoration(String hint) {
+    return InputDecoration(
+      hintText  : hint,
+      filled    : true,
+      fillColor : Colors.white,
+      enabledBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(8),
+        borderSide  : const BorderSide(color: Color(0xFF8B0A1A)),
+      ),
+      focusedBorder: OutlineInputBorder(
+        borderRadius: BorderRadius.circular(8),
+        borderSide  : const BorderSide(color: Color(0xFF8B0A1A), width: 2),
       ),
     );
   }

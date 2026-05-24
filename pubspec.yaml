@@ -32,7 +32,7 @@ dependencies:
   firebase_messaging: ^15.2.1
   firebase_analytics: ^11.3.1
   firebase_crashlytics: ^4.2.1
-  universal_html: ^2.2.4
+  universal_html: ^2.3.0
   url_launcher: ^6.3.1
   
   # --- Machine Learning & Face Detection ---
@@ -73,23 +73,24 @@ flutter:
   # --- Assets Section (Logo aur Models ke liye) ---
   assets:
     - assets/logo1.jpeg
+    - assets/logo.jpeg
     - assets/models/mobilefacenet.tflite
     - assets/profile.png
-    - assets/service-account.json
+    #- assets/service-account.json
     - .env
 
 flutter_launcher_icons:
   android: true
   ios: true
-  image_path: "assets/logo1.jpeg" # Aapke logo ka path
+  image_path: "assets/logo.jpeg" # Aapke logo ka path
   web:
     generate: true
-    image_path: "assets/logo1.jpeg"
+    image_path: "assets/logo.jpeg"
     background_color: "#FDF7F7"
     theme_color: "#8B0A1A"
 flutter_native_splash:
-  color: "#FDF7F7"               # Splash screen ka background color
-  image: "assets/logo1.jpeg"       # Aapka logo path
+  color: "#FFFFFF"               # Splash screen ka background color
+  image: "assets/logo.jpeg"       # Aapka logo path
   android: true
   ios: true
   web: false                     # Web par splash screen zaroori nahi hoti
