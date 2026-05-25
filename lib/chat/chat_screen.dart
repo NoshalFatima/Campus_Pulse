@@ -391,109 +391,125 @@ class _ChatScreenState extends State<ChatScreen>
   // ONESIGNAL — 1-1 (original — unchanged)
   // ─────────────────────────────────────────────────────────────────────────
   Future<void> _sendOneSignalNotification(String msgText) async {
-    try {
-      final receiverSnap = await FirebaseFirestore.instance
-          .collection('Users').doc(widget.receiverId!.trim()).get();
-      if (!receiverSnap.exists) return;
-
-      final String? oneSignalId = receiverSnap.data()?['oneSignalId'];
-      if (oneSignalId == null || oneSignalId.isEmpty) return;
-
-      final String notifBody = msgText.startsWith('http')
-          ? (msgText.contains('.pdf') ? '📄 Sent a document' : '🖼️ Sent an image')
-          : msgText;
-
-      await Dio().post(
-        'https://onesignal.com/api/v1/notifications',
-        data: jsonEncode({
-          'app_id':             _kOneSignalAppId,
-          'include_player_ids': [oneSignalId],
-          'headings':           {'en': currentUserName},
-          'contents':           {'en': notifBody},
-          // 👇 OneSignal ke liye Flutter asset ka sahi address/format yeh hai:
-          'small_icon': 'logo1',
-          'data': {
-            'senderId':   currentUserId,
-            'senderName': currentUserName,
-            'chatId':     chatId,
-          },
-          'priority':           10,
-          'android_visibility': 1,
-        }),
-        options: Options(headers: {
-          'Content-Type':  'application/json',
-          'Authorization': 'Basic $_kOneSignalRestKey',
-        }),
-      );
-    } on DioException catch (e) {
-      debugPrint('❌ OneSignal 1-1: ${e.response?.data}');
-    } catch (e) {
-      debugPrint('❌ OneSignal 1-1: $e');
+  try {
+    final receiverSnap = await FirebaseFirestore.instance
+        .collection('Users')
+        .doc(widget.receiverId!.trim())
+        .get();
+    if (!receiverSnap.exists) return;
+ 
+    // ✅ FIX: oneSignalId → oneSignalSubId
+    final String? subId = receiverSnap.data()?['oneSignalSubId'];
+    if (subId == null || subId.isEmpty) {
+      debugPrint('⚠️ Chat notif: receiver has no oneSignalSubId');
+      return;
     }
+ 
+    final String notifBody = msgText.startsWith('http')
+        ? (msgText.contains('.pdf') ? '📄 Sent a document' : '🖼️ Sent an image')
+        : msgText;
+ 
+    await Dio().post(
+      'https://onesignal.com/api/v1/notifications',
+      data: jsonEncode({
+        'app_id'            : _kOneSignalAppId,
+        'include_player_ids': [subId],          // ✅ subId use ho raha hai
+        'headings'          : {'en': currentUserName},
+        'contents'          : {'en': notifBody},
+        'small_icon'        : 'logo1',
+        'priority'          : 10,
+        'android_visibility': 1,
+        'data': {
+          'type'      : 'chat',
+          'senderId'  : currentUserId,
+          'senderName': currentUserName,
+          'chatId'    : chatId,
+        },
+      }),
+      options: Options(headers: {
+        'Content-Type' : 'application/json',
+        'Authorization': 'Basic $_kOneSignalRestKey',
+      }),
+    );
+    debugPrint('✅ Chat notif sent to subId: $subId');
+  } on DioException catch (e) {
+    debugPrint('❌ OneSignal 1-1: ${e.response?.data}');
+  } catch (e) {
+    debugPrint('❌ OneSignal 1-1: $e');
   }
+}
+ 
 
   // ─────────────────────────────────────────────────────────────────────────
   // ONESIGNAL — GROUP (original — unchanged)
   // ─────────────────────────────────────────────────────────────────────────
   Future<void> _sendOneSignalToGroup(String text, String msgType) async {
-    try {
-      final grpDoc = await FirebaseFirestore.instance
-          .collection('Groups').doc(chatId).get();
-      final List members = (grpDoc.data()?['members'] as List?) ?? [];
-
-      final List<String> playerIds = [];
-      for (final memberId in members) {
-        if (memberId.toString() == currentUserId) continue;
-        final uDoc = await FirebaseFirestore.instance
-            .collection('Users').doc(memberId.toString()).get();
-        if (!uDoc.exists) continue;
-        final String? osId = uDoc.data()?['oneSignalId'];
-        if (osId != null && osId.isNotEmpty) playerIds.add(osId);
-      }
-
-      if (playerIds.isEmpty) return;
-
-      final String grpName =
-          grpDoc.data()?['name']?.toString() ?? widget.partnerName;
-      final String body = msgType == 'image'
-          ? '🖼️ Sent an image'
-          : msgType == 'document'
-              ? '📄 Sent a document'
-              : msgType == 'announcement'
-                  ? '📢 $text'
-                  : text;
-
-      await Dio().post(
-        'https://onesignal.com/api/v1/notifications',
-        data: jsonEncode({
-          'app_id':             _kOneSignalAppId,
-          'include_player_ids': playerIds,
-          'headings':           {'en': '$currentUserName • $grpName'},
-          'contents':           {'en': body},
-          // 👇 OneSignal ke liye Flutter asset ka sahi address/format yeh hai:
-          'small_icon': 'logo1',
-          'data': {
-            'groupId':    chatId,
-            'groupName':  grpName,
-            'senderId':   currentUserId,
-            'senderName': currentUserName,
-            'screen':     'group_chat',
-          },
-          'priority':           10,
-          'android_visibility': 1,
-        }),
-        options: Options(headers: {
-          'Content-Type':  'application/json',
-          'Authorization': 'Basic $_kOneSignalRestKey',
-        }),
-      );
-    } on DioException catch (e) {
-      debugPrint('❌ OneSignal group: ${e.response?.data}');
-    } catch (e) {
-      debugPrint('❌ OneSignal group: $e');
+  try {
+    final grpDoc = await FirebaseFirestore.instance
+        .collection('Groups')
+        .doc(chatId)
+        .get();
+    final List members = (grpDoc.data()?['members'] as List?) ?? [];
+ 
+    final List<String> playerIds = [];
+    for (final memberId in members) {
+      if (memberId.toString() == currentUserId) continue;
+      final uDoc = await FirebaseFirestore.instance
+          .collection('Users')
+          .doc(memberId.toString())
+          .get();
+      if (!uDoc.exists) continue;
+ 
+      // ✅ FIX: oneSignalId → oneSignalSubId
+      final String? subId = uDoc.data()?['oneSignalSubId'];
+      if (subId != null && subId.isNotEmpty) playerIds.add(subId);
     }
+ 
+    if (playerIds.isEmpty) {
+      debugPrint('⚠️ Group notif: no members with oneSignalSubId');
+      return;
+    }
+ 
+    final String grpName =
+        grpDoc.data()?['name']?.toString() ?? widget.partnerName;
+    final String body = msgType == 'image'
+        ? '🖼️ Sent an image'
+        : msgType == 'document'
+            ? '📄 Sent a document'
+            : msgType == 'announcement'
+                ? '📢 $text'
+                : text;
+ 
+    await Dio().post(
+      'https://onesignal.com/api/v1/notifications',
+      data: jsonEncode({
+        'app_id'            : _kOneSignalAppId,
+        'include_player_ids': playerIds,
+        'headings'          : {'en': '$currentUserName • $grpName'},
+        'contents'          : {'en': body},
+        'small_icon'        : 'logo1',
+        'priority'          : 10,
+        'android_visibility': 1,
+        'data': {
+          'type'      : 'chat',
+          'groupId'   : chatId,
+          'groupName' : grpName,
+          'senderId'  : currentUserId,
+          'senderName': currentUserName,
+        },
+      }),
+      options: Options(headers: {
+        'Content-Type' : 'application/json',
+        'Authorization': 'Basic $_kOneSignalRestKey',
+      }),
+    );
+    debugPrint('✅ Group notif sent to ${playerIds.length} members');
+  } on DioException catch (e) {
+    debugPrint('❌ OneSignal group: ${e.response?.data}');
+  } catch (e) {
+    debugPrint('❌ OneSignal group: $e');
   }
-
+}
   // ─────────────────────────────────────────────────────────────────────────
   // REACTIONS — with notification to message sender
   // ─────────────────────────────────────────────────────────────────────────
@@ -517,49 +533,57 @@ class _ChatScreenState extends State<ChatScreen>
   // ✅ NEW: Reaction notification via OneSignal
   // ─────────────────────────────────────────────────────────────────────────
   Future<void> _sendReactionNotification(ChatMessage msg, String emoji) async {
-    try {
-      final senderDoc = await FirebaseFirestore.instance
-          .collection('Users').doc(msg.senderId).get();
-      if (!senderDoc.exists) return;
-      final String? osId = senderDoc.data()?['oneSignalId'];
-      if (osId == null || osId.isEmpty) return;
-
-      if (currentUserName.isEmpty) {
-        final myDoc = await FirebaseFirestore.instance
-            .collection('Users').doc(currentUserId).get();
-        currentUserName = myDoc.data()?['name'] ?? 'Someone';
-      }
-
-      final String preview = msg.isMedia ? '📎 attachment' : '"${msg.text.length > 30 ? msg.text.substring(0, 30) + '…' : msg.text}"';
-
-      await Dio().post(
-        'https://onesignal.com/api/v1/notifications',
-        data: jsonEncode({
-          'app_id':             _kOneSignalAppId,
-          'include_player_ids': [osId],
-          'headings':           {'en': '$currentUserName reacted $emoji'},
-          'contents':           {'en': 'Reacted to your message: $preview'},
-          // 👇 OneSignal ke liye Flutter asset ka sahi address/format yeh hai:
-          'small_icon': 'logo1',
-          'data': {
-            'chatId':     chatId,
-            'senderId':   currentUserId,
-            'senderName': currentUserName,
-            'type':       'reaction',
-          },
-          'priority':           10,
-          'android_visibility': 1,
-        }),
-        options: Options(headers: {
-          'Content-Type':  'application/json',
-          'Authorization': 'Basic $_kOneSignalRestKey',
-        }),
-      );
-      debugPrint('✅ Reaction notification sent to ${msg.senderId}');
-    } catch (e) {
-      debugPrint('❌ Reaction notification: $e');
+  try {
+    final senderDoc = await FirebaseFirestore.instance
+        .collection('Users')
+        .doc(msg.senderId)
+        .get();
+    if (!senderDoc.exists) return;
+ 
+    // ✅ FIX: oneSignalId → oneSignalSubId
+    final String? subId = senderDoc.data()?['oneSignalSubId'];
+    if (subId == null || subId.isEmpty) return;
+ 
+    if (currentUserName.isEmpty) {
+      final myDoc = await FirebaseFirestore.instance
+          .collection('Users')
+          .doc(currentUserId)
+          .get();
+      currentUserName = myDoc.data()?['name'] ?? 'Someone';
     }
+ 
+    final String preview = msg.isMedia
+        ? '📎 attachment'
+        : '"${msg.text.length > 30 ? msg.text.substring(0, 30) + '…' : msg.text}"';
+ 
+    await Dio().post(
+      'https://onesignal.com/api/v1/notifications',
+      data: jsonEncode({
+        'app_id'            : _kOneSignalAppId,
+        'include_player_ids': [subId],
+        'headings'          : {'en': '$currentUserName reacted $emoji'},
+        'contents'          : {'en': 'Reacted to your message: $preview'},
+        'small_icon'        : 'logo1',
+        'priority'          : 10,
+        'android_visibility': 1,
+        'data': {
+          'type'      : 'reaction',
+          'chatId'    : chatId,
+          'senderId'  : currentUserId,
+          'senderName': currentUserName,
+        },
+      }),
+      options: Options(headers: {
+        'Content-Type' : 'application/json',
+        'Authorization': 'Basic $_kOneSignalRestKey',
+      }),
+    );
+    debugPrint('✅ Reaction notif sent');
+  } catch (e) {
+    debugPrint('❌ Reaction notification: $e');
   }
+}
+ 
 
   // ─────────────────────────────────────────────────────────────────────────
   // DELETE

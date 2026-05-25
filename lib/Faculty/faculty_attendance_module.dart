@@ -488,180 +488,175 @@ class _TeacherAttendanceFragmentState
       _showSnack('No active session.'); return;
     }
     _autoStopTimer?.cancel();
-    try {
-      final stParts = _currentSessionPath.split('/');
-      final stClass = stParts.first;
-      final stNode  = stParts.length > 1 ? stParts.last : stParts.first;
 
+    final parts    = _currentSessionPath.split('/');
+    final clsNode  = parts.first;
+    final sessNode = parts.length > 1 ? parts.last : parts.first;
+
+    try {
       await _attendanceRootRef
           .child('AttendanceSession')
-          .child(stClass)
-          .child(stNode)
+          .child(clsNode)
+          .child(sessNode)
           .child('status')
           .set('stopped')
           .timeout(const Duration(seconds: 10));
-
-      _showSnack('✅ Attendance stopped. Marking absent students...');
-      await _sendAttendanceNotification(isStarting: false);
-
-      // ── KEY FIX: Mark absent all students who didn't attend ──
-      await _markAbsentStudents();
-
-      await _clearCache();
-      if (mounted) {
-        setState(() {
-          _statusText      = 'Attendance Stopped ⛔';
-          _accuracyText    = '📡 Accuracy: N/A';
-          _isSessionActive = false;
-          _lastSessionStatus = null;
-        });
-      }
     } catch (e) {
-      _showSnack('Failed to stop attendance.', isError: true);
-      debugPrint('Stop attendance: $e');
+      _showSnack('Failed to stop. Check internet.', isError: true);
+      return;
+    }
+
+    await _sendAttendanceNotification(isStarting: false);
+    _showSnack('Attendance stopped. Marking absent students...');
+
+    // Mark absent — await so it completes before clearing state
+    await _markAbsentStudents(clsNode, sessNode);
+
+    await _clearCache();
+    if (mounted) {
+      setState(() {
+        _statusText      = 'Attendance Stopped ⛔';
+        _accuracyText    = '📡 Accuracy: N/A';
+        _isSessionActive = false;
+        _lastSessionStatus = null;
+      });
     }
   }
 
-  // ── MARK ABSENT — core fix ────────────────────────────────────
-  // Called when teacher stops session.
-  // Fetches all students of this class from Firestore,
-  // checks who already marked present in RTDB today,
-  // marks everyone else as Absent.
-  Future<void> _markAbsentStudents() async {
-    if (_currentSessionPath.isEmpty) return;
-
+  
+  Future<void> _markAbsentStudents(
+    String classPath, String sessionId) async {
     if (mounted) setState(() => _isMarkingAbsent = true);
+    debugPrint('=== MARK ABSENT START ===');
+    debugPrint('classPath : $classPath');
+    debugPrint('sessionId : $sessionId');
 
     try {
-      final pathParts = _currentSessionPath.split('/');
-      final classPath = pathParts.first;
-      final sessionId = pathParts.length > 1 ? pathParts.last : _subjectKey;
-      final subjKey   = _extractSubjectKey(sessionId);
-      final subjDisplay = subjKey.replaceAll('_', ' ');
-
-      // Get session date from RTDB session data (most reliable)
-      String today = _today();
+      // ── 1. Fetch session data from RTDB ──────────────────────
+      Map<String, dynamic> sData = {};
       try {
-        final sessionSnap = await _attendanceRootRef
+        final snap = await _attendanceRootRef
             .child('AttendanceSession')
             .child(classPath)
             .child(sessionId)
-            .get();
-        if (sessionSnap.exists && sessionSnap.value != null) {
-          final sData = Map<String, dynamic>.from(sessionSnap.value as Map);
-          // Use stored sessionDate if available
-          if (sData['sessionDate'] != null) {
-            today = sData['sessionDate'].toString();
-            debugPrint('Session date from RTDB: ' + today);
-          }
+            .get()
+            .timeout(const Duration(seconds: 10));
+        if (snap.exists && snap.value != null) {
+          sData = Map<String, dynamic>.from(snap.value as Map);
         }
       } catch (e) {
-        debugPrint('Could not fetch session date, using today: ' + e.toString());
+        debugPrint('Session fetch error: $e');
       }
 
-      debugPrint('=== MARK ABSENT ===');
-      debugPrint('classPath : ' + classPath);
-      debugPrint('sessionId : ' + sessionId);
-      debugPrint('subjKey   : ' + subjKey);
-      debugPrint('date      : ' + today);
+      debugPrint('Session data keys: ' + sData.keys.toString());
 
-      // Get dept/sem/shift from RTDB session data directly
-      // (selectedDept etc may be null if app restarted from cache)
-      String dept = selectedDept ?? '';
-      String sem  = selectedSem  ?? '';
-      String shift = selectedShift ?? '';
+      // ── 2. Extract dept / sem / shift ────────────────────────
+      String dept  = sData['department']?.toString() ?? selectedDept  ?? '';
+      String sem   = sData['semester']?.toString()   ?? selectedSem   ?? '';
+      String shift = sData['shift']?.toString()      ?? selectedShift ?? '';
+      String subjDisplay = sData['subjectName']?.toString()
+          ?? sessionId.replaceAll(RegExp(r'_\d+\$'), '').replaceAll('_', ' ');
 
-      try {
-        final sessionSnap = await _attendanceRootRef
-            .child('AttendanceSession')
-            .child(classPath)
-            .child(sessionId)
-            .get();
-        if (sessionSnap.exists && sessionSnap.value != null) {
-          final sData = Map<String, dynamic>.from(sessionSnap.value as Map);
-          if (dept.isEmpty)  dept  = sData['department']?.toString() ?? '';
-          if (sem.isEmpty)   sem   = sData['semester']?.toString()   ?? '';
-          if (shift.isEmpty) shift = sData['shift']?.toString()      ?? '';
-        }
-      } catch (e) {
-        debugPrint('Session fetch for dept/sem/shift: ' + e.toString());
-      }
-
-      debugPrint('dept: ' + dept + ' sem: ' + sem + ' shift: ' + shift);
+      debugPrint('dept=$dept sem=$sem shift=$shift subj=$subjDisplay');
 
       if (dept.isEmpty || shift.isEmpty) {
-        debugPrint('Cannot mark absent — dept/shift empty');
+        debugPrint('Cannot mark absent — missing dept/shift');
         if (mounted) setState(() => _isMarkingAbsent = false);
         return;
       }
 
-      // Sem stored as '8th' in Firestore — normalize
-      final semNum    = sem.replaceAll(RegExp(r'[^0-9]'), '');
-      final semSuffix = _semSuffix(semNum);
+      // ── 3. Session date ──────────────────────────────────────
+      String today = sData['sessionDate']?.toString() ?? _today();
+      debugPrint('date=$today');
 
-      QuerySnapshot snap;
+      // ── 4. Fetch students from Firestore ─────────────────────
+      final semNum    = sem.replaceAll(RegExp(r'[^0-9]'), '');
+      final semSuffix = _semSuffix(semNum); // '8th'
+
+      debugPrint('Querying students: dept=$dept sem=$semSuffix/$sem shift=$shift');
+
+      QuerySnapshot? snap;
+
+      // Try suffix format first ('8th')
       try {
-        // Try with suffix format first ('8th')
-        snap = await _firestore
-            .collection('Users')
+        final q = await _firestore.collection('Users')
             .where('role',     isEqualTo: 'student')
             .where('dept',     isEqualTo: dept)
             .where('semester', isEqualTo: semSuffix)
             .where('shift',    isEqualTo: shift)
             .get()
             .timeout(const Duration(seconds: 15));
+        if (q.docs.isNotEmpty) snap = q;
+      } catch (e) { debugPrint('Query 1 error: $e'); }
 
-        // If no results, try with 'Semester 8' format
-        if (snap.docs.isEmpty) {
-          snap = await _firestore
-              .collection('Users')
+      // Try 'Semester N' format
+      if (snap == null || snap.docs.isEmpty) {
+        try {
+          final q = await _firestore.collection('Users')
               .where('role',     isEqualTo: 'student')
               .where('dept',     isEqualTo: dept)
               .where('semester', isEqualTo: sem)
               .where('shift',    isEqualTo: shift)
               .get()
               .timeout(const Duration(seconds: 15));
+          if (q.docs.isNotEmpty) snap = q;
+        } catch (e) { debugPrint('Query 2 error: $e'); }
+      }
+
+      // Try without shift filter (fallback)
+      if (snap == null || snap.docs.isEmpty) {
+        try {
+          final q = await _firestore.collection('Users')
+              .where('role',     isEqualTo: 'student')
+              .where('dept',     isEqualTo: dept)
+              .where('semester', isEqualTo: semSuffix)
+              .get()
+              .timeout(const Duration(seconds: 15));
+          snap = q;
+          debugPrint('Fallback query (no shift): ' + q.docs.length.toString() + ' students');
+        } catch (e) { debugPrint('Query 3 error: $e'); }
+      }
+
+      final students = snap?.docs ?? [];
+      debugPrint('Total students found: ' + students.length.toString());
+
+      if (students.isEmpty) {
+        debugPrint('No students found — check dept/sem/shift values');
+        if (mounted) setState(() => _isMarkingAbsent = false);
+        return;
+      }
+
+      // ── 5. Check who already marked present ─────────────────
+      Set<String> alreadyPresent = {};
+      try {
+        final existSnap = await _attendanceRootRef
+            .child('AttendanceRecords')
+            .child(classPath)
+            .child(sessionId)
+            .child(today)
+            .get()
+            .timeout(const Duration(seconds: 10));
+        if (existSnap.exists && existSnap.value != null) {
+          final dayMap = Map<String, dynamic>.from(existSnap.value as Map);
+          alreadyPresent = dayMap.keys.toSet();
         }
-      } catch (e) {
-        debugPrint('Fetch students error: $e');
-        if (mounted) setState(() => _isMarkingAbsent = false);
-        return;
-      }
+      } catch (e) { debugPrint('Existing records fetch: $e'); }
 
-      debugPrint('Students found: ${snap.docs.length}');
+      debugPrint('Already present: ' + alreadyPresent.length.toString());
 
-      if (snap.docs.isEmpty) {
-        debugPrint('No students for $dept $sem/$semSuffix $shift');
-        if (mounted) setState(() => _isMarkingAbsent = false);
-        return;
-      }
-
-      // 2. Check who already marked present today
-      // Path: AttendanceRecords/CLASS/SUBJECT/date/uid
-      final existingSnap = await _attendanceRootRef
-          .child('AttendanceRecords')
-          .child(classPath)
-          .child(sessionId)
-          .child(today)
-          .get();
-
-      final Set<String> alreadyMarked = {};
-      if (existingSnap.exists && existingSnap.value != null) {
-        final dayMap = Map<String, dynamic>.from(existingSnap.value as Map);
-        alreadyMarked.addAll(dayMap.keys);
-        debugPrint('Already present: ${alreadyMarked.length} students');
-      }
-
-      // 3. Mark absent for everyone not present
+      // ── 6. Mark absent for everyone not present ──────────────
       int absentCount = 0;
-      for (final doc in snap.docs) {
+      for (final doc in students) {
         final uid = doc.id;
-        if (alreadyMarked.contains(uid)) continue;
-
+        if (alreadyPresent.contains(uid)) {
+          debugPrint('Skip (present): $uid');
+          continue;
+        }
         final data  = doc.data() as Map<String, dynamic>;
         final name  = data['name']?.toString()  ?? '';
         final regNo = data['regNo']?.toString() ?? '';
 
+        debugPrint('Marking absent: $name ($regNo)');
         try {
           await _attendanceRootRef
               .child('AttendanceRecords')
@@ -677,20 +672,20 @@ class _TeacherAttendanceFragmentState
             'regNo'       : regNo,
             'uid'         : uid,
             'subject'     : subjDisplay,
+            'sessionId'   : sessionId,
             'dept'        : dept,
             'semester'    : semSuffix,
             'shift'       : shift,
           });
           absentCount++;
-          debugPrint('Absent: $name ($regNo)');
         } catch (e) {
           debugPrint('Failed absent for $uid: $e');
         }
       }
 
-      debugPrint('Auto-absent done: $absentCount students marked');
+      debugPrint('=== MARK ABSENT DONE: $absentCount marked ===');
       if (mounted && absentCount > 0) {
-        _showSnack('$absentCount student(s) marked absent automatically.');
+        _showSnack('$absentCount student(s) marked absent.');
       }
     } catch (e) {
       debugPrint('_markAbsentStudents error: $e');
@@ -699,8 +694,7 @@ class _TeacherAttendanceFragmentState
     }
   }
 
-  // Convert sem number to suffix format matching Firestore
-  // '8' -> '8th', '1' -> '1st', '2' -> '2nd', '3' -> '3rd'
+  
   String _semSuffix(String num) {
     switch (num) {
       case '1': return '1st';
@@ -742,7 +736,10 @@ class _TeacherAttendanceFragmentState
       }
 
       // Also mark absents on auto-stop
-      await _markAbsentStudents();
+      final asParts2 = pathToStop.split('/');
+      final asClass2 = asParts2.first;
+      final asNode2  = asParts2.length > 1 ? asParts2.last : asParts2.first;
+      await _markAbsentStudents(asClass2, asNode2);
       _clearCache();
 
       if (mounted) {

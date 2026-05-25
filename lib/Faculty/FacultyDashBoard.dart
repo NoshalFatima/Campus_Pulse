@@ -1,9 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
-import 'package:campus_pulse/services/onesignal_service.dart'; // 👈 Yeh import add karein
-import 'package:flutter/foundation.dart'; // 👈 kIsWeb ke liye agar pehle se nahi hai
+import 'package:campus_pulse/services/onesignal_service.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:flutter/foundation.dart' show kIsWeb, debugPrint;
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_database/firebase_database.dart';
@@ -16,8 +15,6 @@ import '../chat/users_list_fragment.dart';
 import '/Faculty/AnnouncementScreen.dart';
 import 'faculty_attendance_module.dart';
 import 'faculty_profile_screen.dart';
-
-// ⚠️ Settings screen path — apni file ke mutabiq adjust karo
 import '../settings/faculty_settings_screen.dart';
 
 class FacultyDashBoard extends StatefulWidget {
@@ -32,24 +29,23 @@ class _FacultyDashBoardState extends State<FacultyDashBoard> {
   final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
   int _selectedIndex = 0;
 
-  // ── Faculty profile ────────────────────────────────────────────────────────
-  String _facultyName     = '';
-  String _facultyEmail    = '';
-  String _facultyDept     = '';
-  String _facultyDesig    = '';
+  // ── Faculty profile ────────────────────────────────────────────────────
+  String  _facultyName     = '';
+  String  _facultyEmail    = '';
+  String  _facultyDept     = '';
+  String  _facultyDesig    = '';
   String? _facultyPhotoUrl;
 
-  // ── Unread counts ──────────────────────────────────────────────────────────
+  // ── Unread counts ──────────────────────────────────────────────────────
   int _unreadAnnouncements = 0;
   int _unreadChat          = 0;
 
-  // ── Bell notifications ─────────────────────────────────────────────────────
+  // ── Bell notifications ─────────────────────────────────────────────────
   final List<Map<String, dynamic>> _osNotifications = [];
 
-  // ── Subscriptions ──────────────────────────────────────────────────────────
+  // ── Subscriptions ─────────────────────────────────────────────────────
   StreamSubscription<QuerySnapshot>? _announcementSub;
-  StreamSubscription? _chatSub;
-
+  StreamSubscription?                _chatSub;
   bool _lifecycleListenerAdded = false;
 
   final List<String> _titles = [
@@ -71,9 +67,9 @@ class _FacultyDashBoardState extends State<FacultyDashBoard> {
     super.dispose();
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────────────
   // FETCH FACULTY PROFILE
-  // ─────────────────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────────────
   Future<void> _fetchFacultyProfile() async {
     try {
       final user = FirebaseAuth.instance.currentUser;
@@ -87,57 +83,66 @@ class _FacultyDashBoardState extends State<FacultyDashBoard> {
       if (!doc.exists || !mounted) return;
       final data = doc.data()!;
 
-      String _f(List<String> keys) {
+      String f(List<String> keys) {
         for (final k in keys) {
           final v = data[k];
-          if (v != null && v.toString().trim().isNotEmpty) return v.toString().trim();
+          if (v != null && v.toString().trim().isNotEmpty) {
+            return v.toString().trim();
+          }
         }
         return '';
       }
 
       setState(() {
-        _facultyName    = _f(['name', 'fullName', 'displayName']);
+        _facultyName     = f(['name', 'fullName', 'displayName']);
         if (_facultyName.isEmpty) _facultyName = user.displayName?.trim() ?? 'Faculty';
-        _facultyEmail   = _f(['email']);
+        _facultyEmail    = f(['email']);
         if (_facultyEmail.isEmpty) _facultyEmail = user.email ?? '';
-        _facultyDept    = _f(['dept', 'department']);
-        _facultyDesig   = _f(['designation', 'designation', 'position', 'role']);
-        final photo     = _f(['profilePic', 'photoUrl', 'photoURL', 'profileImage']);
+        _facultyDept     = f(['dept', 'department']);
+        _facultyDesig    = f(['designation', 'position', 'role']);
+        final photo      = f(['profilePic', 'photoUrl', 'photoURL', 'profileImage']);
         _facultyPhotoUrl = photo.isNotEmpty ? photo : null;
       });
 
-      // OneSignal tag for faculty
-      _registerOneSignalTag(user.uid);
+      // ✅ Register OneSignal tags after profile load
+      await _registerOneSignalTag(user.uid);
 
-      // Teacher does not need announcement unread count
       if (!kIsWeb) _listenChatUnread(user.uid);
     } catch (e) {
       debugPrint("❌ Faculty profile fetch error: $e");
     }
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // ONESIGNAL TAG
-  // ─────────────────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────────────
+  // ONESIGNAL TAG REGISTRATION
+  // ✅ Fixed: no duplicate requestPermission, web-safe, correct field
+  // ─────────────────────────────────────────────────────────────────────
   Future<void> _registerOneSignalTag(String uid) async {
+    if (kIsWeb) {
+      debugPrint('ℹ️ Faculty OneSignal: Web — tags skipped, REST API used');
+      return;
+    }
     try {
+      // loginUser() links device to Firebase UID + saves oneSignalSubId to Firestore
+      // Do NOT call requestPermission here — already done in initialize()
       await OneSignalService.loginUser(uid);
-      OneSignal.User.addTags({
+
+      await OneSignal.User.addTags({
         'all_campus_tag': 'true',
         'role'          : 'teacher',
         if (_facultyDept.isNotEmpty)
           'dept': _facultyDept.trim().replaceAll(' ', '_').toLowerCase(),
       });
-      await OneSignal.Notifications.requestPermission(true);
-      debugPrint("✅ Faculty OneSignal tag set");
+
+      debugPrint('✅ Faculty OneSignal tags set');
     } catch (e) {
-      debugPrint("❌ Faculty OneSignal tag error: $e");
+      debugPrint('❌ Faculty OneSignal tag error: $e');
     }
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────────────
   // ANNOUNCEMENT UNREAD COUNT
-  // ─────────────────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────────────
   void _listenAnnouncementUnread(String uid) {
     _announcementSub = FirebaseFirestore.instance
         .collection('Announcements')
@@ -145,8 +150,7 @@ class _FacultyDashBoardState extends State<FacultyDashBoard> {
         .snapshots()
         .listen((snapshot) async {
       if (!mounted) return;
-      final allIds = snapshot.docs.map((d) => d.id).toList();
-      await _recalcUnread(uid, allIds);
+      await _recalcUnread(uid, snapshot.docs.map((d) => d.id).toList());
     });
 
     if (!_lifecycleListenerAdded) {
@@ -165,8 +169,8 @@ class _FacultyDashBoardState extends State<FacultyDashBoard> {
   }
 
   Future<void> _recalcUnread(String uid, List<String> allIds) async {
-    final prefs = await SharedPreferences.getInstance();
-    final firstLoginKey  = 'first_login_done_$uid';
+    final prefs         = await SharedPreferences.getInstance();
+    final firstLoginKey = 'first_login_done_$uid';
     final bool firstDone = prefs.getBool(firstLoginKey) ?? false;
 
     if (!firstDone) {
@@ -178,13 +182,12 @@ class _FacultyDashBoardState extends State<FacultyDashBoard> {
 
     final readIds = (prefs.getStringList('read_announcements_$uid') ?? []).toSet();
     final count   = allIds.where((id) => !readIds.contains(id)).length;
-    debugPrint("🔔 Faculty unread recalc: total=\${allIds.length} read=\${readIds.length} unread=\$count");
     if (mounted) setState(() => _unreadAnnouncements = count);
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // CHAT UNREAD COUNT (RTDB)
-  // ─────────────────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────────────
+  // CHAT UNREAD COUNT
+  // ─────────────────────────────────────────────────────────────────────
   void _listenChatUnread(String uid) {
     _chatSub = FirebaseDatabase.instance
         .ref('Chats')
@@ -194,7 +197,6 @@ class _FacultyDashBoardState extends State<FacultyDashBoard> {
 
       int total = 0;
       try {
-        // Web pe Map<Object?, Object?> aata hai — safely convert karo
         final raw = event.snapshot.value;
         if (raw is! Map) return;
 
@@ -209,27 +211,24 @@ class _FacultyDashBoardState extends State<FacultyDashBoard> {
               final isRead    = msgVal['isRead'];
               final senderId  = msgVal['senderId']?.toString();
               final isDeleted = msgVal['isDeleted'];
-
-              if (isRead == false &&
-                  senderId != uid &&
-                  isDeleted != true) {
+              if (isRead == false && senderId != uid && isDeleted != true) {
                 total++;
               }
             } catch (_) {}
           });
         });
       } catch (e) {
-        debugPrint("❌ Chat unread parse error: $e");
+        debugPrint("❌ Chat unread parse: $e");
       }
 
       if (mounted) setState(() => _unreadChat = total);
     });
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // ONESIGNAL BELL
-  // ─────────────────────────────────────────────────────────────────────────
-  // ── Persist bell notifications in SharedPreferences ──────────────────────
+  // ─────────────────────────────────────────────────────────────────────
+  // ONESIGNAL BELL NOTIFICATIONS
+  // ✅ Fixed: kIsWeb guard added to prevent crash on web
+  // ─────────────────────────────────────────────────────────────────────
   static const String _bellKey = 'bell_notifications';
 
   Future<void> _loadPersistedNotifications() async {
@@ -269,7 +268,6 @@ class _FacultyDashBoardState extends State<FacultyDashBoard> {
         'time' : (n['time'] as DateTime).millisecondsSinceEpoch,
         'read' : n['read'],
       }).toList();
-      // Keep only last 30 notifications
       final trimmed = list.length > 30 ? list.sublist(0, 30) : list;
       await prefs.setString('${_bellKey}_${user.uid}', jsonEncode(trimmed));
     } catch (e) {
@@ -278,8 +276,13 @@ class _FacultyDashBoardState extends State<FacultyDashBoard> {
   }
 
   void _listenOneSignalNotifications() {
-    // Load previously persisted notifications first
     _loadPersistedNotifications();
+
+    // ✅ Fixed: entire OneSignal SDK block guarded with kIsWeb
+    if (kIsWeb) {
+      debugPrint('ℹ️ OneSignal bell: Web — SDK listeners skipped');
+      return;
+    }
 
     OneSignal.Notifications.addForegroundWillDisplayListener((event) {
       if (!mounted) return;
@@ -296,25 +299,26 @@ class _FacultyDashBoardState extends State<FacultyDashBoard> {
       });
       _persistNotifications();
     });
-if (!kIsWeb) {
+
     OneSignal.Notifications.addClickListener((event) {
       if (!mounted) return;
       final type = event.notification.additionalData?['type'];
       if (type == 'announcement') _onItemTapped(2);
       else if (type == 'chat')    _onItemTapped(4);
     });
-  }}
+  }
 
-  // ─────────────────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────────────
   // BELL PANEL
-  // ─────────────────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────────────
   void _showNotificationsPanel() {
     showModalBottomSheet(
       context: context,
       backgroundColor: Colors.transparent,
       isScrollControlled: true,
       builder: (ctx) => StatefulBuilder(builder: (ctx, setModal) {
-        final unreadCount = _osNotifications.where((n) => n['read'] == false).length;
+        final unreadCount =
+            _osNotifications.where((n) => n['read'] == false).length;
         return Container(
           height: MediaQuery.of(context).size.height * 0.65,
           decoration: const BoxDecoration(
@@ -331,7 +335,8 @@ if (!kIsWeb) {
                     borderRadius: BorderRadius.circular(2)),
               ),
               Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 20, vertical: 14),
                 child: Row(
                   children: [
                     const Icon(Icons.notifications_active_rounded,
@@ -343,11 +348,9 @@ if (!kIsWeb) {
                             fontWeight: FontWeight.bold,
                             color: Color(0xFF8B0A1A))),
                     const Spacer(),
-                    // Settings icon — opens FacultySettingsScreen
                     IconButton(
                       icon: const Icon(Icons.settings_outlined,
                           color: Color(0xFF8B0A1A), size: 20),
-                      tooltip: "Notification Settings",
                       onPressed: () {
                         Navigator.pop(ctx);
                         Navigator.push(
@@ -361,12 +364,15 @@ if (!kIsWeb) {
                       TextButton(
                         onPressed: () {
                           setModal(() {
-                            for (final n in _osNotifications) n['read'] = true;
+                            for (final n in _osNotifications) {
+                              n['read'] = true;
+                            }
                           });
                           setState(() {});
                         },
                         child: const Text("Mark all read",
-                            style: TextStyle(color: Color(0xFF8B0A1A), fontSize: 12)),
+                            style: TextStyle(
+                                color: Color(0xFF8B0A1A), fontSize: 12)),
                       ),
                   ],
                 ),
@@ -383,7 +389,8 @@ if (!kIsWeb) {
                             const SizedBox(height: 10),
                             Text("No notifications yet",
                                 style: TextStyle(
-                                    color: Colors.grey.shade400, fontSize: 14)),
+                                    color: Colors.grey.shade400,
+                                    fontSize: 14)),
                           ],
                         ),
                       )
@@ -391,9 +398,10 @@ if (!kIsWeb) {
                         padding: const EdgeInsets.symmetric(vertical: 8),
                         itemCount: _osNotifications.length,
                         itemBuilder: (_, i) {
-                          final n       = _osNotifications[i];
-                          final isRead  = n['read'] == true;
-                          final diff    = DateTime.now().difference(n['time'] as DateTime);
+                          final n      = _osNotifications[i];
+                          final isRead = n['read'] == true;
+                          final diff   =
+                              DateTime.now().difference(n['time'] as DateTime);
                           final timeStr = diff.inMinutes < 1
                               ? "Just now"
                               : diff.inMinutes < 60
@@ -401,6 +409,7 @@ if (!kIsWeb) {
                                   : diff.inHours < 24
                                       ? "${diff.inHours}h ago"
                                       : "${diff.inDays}d ago";
+
                           return InkWell(
                             onTap: () {
                               setModal(() => n['read'] = true);
@@ -412,12 +421,14 @@ if (!kIsWeb) {
                               decoration: BoxDecoration(
                                 color: isRead
                                     ? Colors.white
-                                    : const Color(0xFF8B0A1A).withOpacity(0.05),
+                                    : const Color(0xFF8B0A1A)
+                                        .withOpacity(0.05),
                                 borderRadius: BorderRadius.circular(14),
                                 border: Border.all(
                                   color: isRead
                                       ? Colors.grey.shade200
-                                      : const Color(0xFF8B0A1A).withOpacity(0.25),
+                                      : const Color(0xFF8B0A1A)
+                                          .withOpacity(0.25),
                                 ),
                               ),
                               child: Row(
@@ -428,7 +439,8 @@ if (!kIsWeb) {
                                     decoration: BoxDecoration(
                                       color: isRead
                                           ? Colors.grey.shade100
-                                          : const Color(0xFF8B0A1A).withOpacity(0.1),
+                                          : const Color(0xFF8B0A1A)
+                                              .withOpacity(0.1),
                                       shape: BoxShape.circle,
                                     ),
                                     child: Icon(Icons.campaign_rounded,
@@ -440,7 +452,8 @@ if (!kIsWeb) {
                                   const SizedBox(width: 10),
                                   Expanded(
                                     child: Column(
-                                      crossAxisAlignment: CrossAxisAlignment.start,
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
                                       children: [
                                         Text(n['title'],
                                             style: TextStyle(
@@ -448,29 +461,35 @@ if (!kIsWeb) {
                                                     ? FontWeight.w500
                                                     : FontWeight.bold,
                                                 fontSize: 13.5,
-                                                color: const Color(0xFF1A1A1A))),
+                                                color:
+                                                    const Color(0xFF1A1A1A))),
                                         if ((n['body'] as String).isNotEmpty)
                                           Padding(
-                                            padding: const EdgeInsets.only(top: 3),
+                                            padding: const EdgeInsets.only(
+                                                top: 3),
                                             child: Text(n['body'],
                                                 style: TextStyle(
                                                     fontSize: 12,
-                                                    color: Colors.grey.shade600),
+                                                    color: Colors.grey
+                                                        .shade600),
                                                 maxLines: 2,
-                                                overflow: TextOverflow.ellipsis),
+                                                overflow:
+                                                    TextOverflow.ellipsis),
                                           ),
                                         const SizedBox(height: 4),
                                         Text(timeStr,
                                             style: TextStyle(
                                                 fontSize: 10,
-                                                color: Colors.grey.shade400)),
+                                                color:
+                                                    Colors.grey.shade400)),
                                       ],
                                     ),
                                   ),
                                   if (!isRead)
                                     Container(
                                       width: 8, height: 8,
-                                      margin: const EdgeInsets.only(top: 4),
+                                      margin:
+                                          const EdgeInsets.only(top: 4),
                                       decoration: const BoxDecoration(
                                           color: Color(0xFF8B0A1A),
                                           shape: BoxShape.circle),
@@ -489,18 +508,22 @@ if (!kIsWeb) {
     );
   }
 
+  // ─────────────────────────────────────────────────────────────────────
+  // NAVIGATION
+  // ─────────────────────────────────────────────────────────────────────
   void _onItemTapped(int index) {
     setState(() => _selectedIndex = index);
     _pageController.animateToPage(index,
         duration: const Duration(milliseconds: 400), curve: Curves.easeInOut);
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────────────
   // BUILD
-  // ─────────────────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
-    final bellUnread = _osNotifications.where((n) => n['read'] == false).length;
+    final bellUnread =
+        _osNotifications.where((n) => n['read'] == false).length;
 
     return Scaffold(
       key: _scaffoldKey,
@@ -508,7 +531,6 @@ if (!kIsWeb) {
       drawer: _buildDrawer(),
       body: Stack(
         children: [
-          // ── Curved header ─────────────────────────────────────────────
           Positioned(
             top: 0, left: 0, right: 0,
             child: CustomPaint(
@@ -516,16 +538,17 @@ if (!kIsWeb) {
               painter: HeaderCurvedPainter(),
             ),
           ),
-
-          // ── Toolbar ───────────────────────────────────────────────────
           SafeArea(
             child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+              padding: const EdgeInsets.symmetric(
+                  horizontal: 10, vertical: 5),
               child: Row(
                 children: [
                   IconButton(
-                    icon: const Icon(Icons.menu, color: Colors.white, size: 28),
-                    onPressed: () => _scaffoldKey.currentState?.openDrawer(),
+                    icon: const Icon(Icons.menu,
+                        color: Colors.white, size: 28),
+                    onPressed: () =>
+                        _scaffoldKey.currentState?.openDrawer(),
                   ),
                   const SizedBox(width: 10),
                   Text(
@@ -536,7 +559,6 @@ if (!kIsWeb) {
                         fontWeight: FontWeight.bold),
                   ),
                   const Spacer(),
-                  // Bell icon with badge
                   Stack(
                     children: [
                       IconButton(
@@ -570,8 +592,6 @@ if (!kIsWeb) {
               ),
             ),
           ),
-
-          // ── PageView ──────────────────────────────────────────────────
           Padding(
             padding: const EdgeInsets.only(top: 80),
             child: PageView(
@@ -588,8 +608,7 @@ if (!kIsWeb) {
                 }
               },
               children: [
-                FacultyHomeDashboard(
-                    parentPageController: _pageController),
+                FacultyHomeDashboard(parentPageController: _pageController),
                 const Center(child: Text("Events")),
                 const AnnouncementFragment(),
                 const TeacherAttendanceFragment(),
@@ -598,17 +617,15 @@ if (!kIsWeb) {
               ],
             ),
           ),
-
-          // ── Bottom nav ────────────────────────────────────────────────
           _buildFloatingBottomMenu(),
         ],
       ),
     );
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // FLOATING BOTTOM MENU
-  // ─────────────────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────────────
+  // BOTTOM MENU
+  // ─────────────────────────────────────────────────────────────────────
   Widget _buildFloatingBottomMenu() {
     return Align(
       alignment: Alignment.bottomCenter,
@@ -628,12 +645,12 @@ if (!kIsWeb) {
         child: Row(
           mainAxisAlignment: MainAxisAlignment.spaceEvenly,
           children: [
-            _menuIcon(Icons.home_filled, "Home", 0),
-            _menuIcon(Icons.event_outlined, "Events", 1),
-            _menuIcon(Icons.notifications, "Alerts", 2),
-            _menuIcon(Icons.qr_code_scanner, "Scan", 3),
-            _menuIconBadge(Icons.chat_bubble, "Chat", 4, _unreadChat),
-            _menuIcon(Icons.person, "Profile", 5),
+            _menuIcon(Icons.home_filled,      "Home",       0),
+            _menuIcon(Icons.event_outlined,   "Events",     1),
+            _menuIcon(Icons.notifications,    "Alerts",     2),
+            _menuIcon(Icons.qr_code_scanner,  "Scan",       3),
+            _menuIconBadge(Icons.chat_bubble, "Chat",       4, _unreadChat),
+            _menuIcon(Icons.person,           "Profile",    5),
           ],
         ),
       ),
@@ -708,15 +725,14 @@ if (!kIsWeb) {
     );
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────────────
   // DRAWER
-  // ─────────────────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────────────
   Widget _buildDrawer() {
     return Drawer(
       child: SafeArea(
         child: Column(
           children: [
-            // Header
             UserAccountsDrawerHeader(
               margin: EdgeInsets.zero,
               decoration: const BoxDecoration(color: Color(0xFF8B0A1A)),
@@ -765,8 +781,6 @@ if (!kIsWeb) {
                     : null,
               ),
             ),
-
-            // Nav items — scrollable to avoid overflow
             Expanded(
               child: SingleChildScrollView(
                 child: Column(
@@ -786,7 +800,8 @@ if (!kIsWeb) {
                     const Divider(height: 1),
                     _drawerItem(Icons.settings_outlined, "Settings", () {
                       Navigator.pop(context);
-                      Navigator.push(context,
+                      Navigator.push(
+                          context,
                           MaterialPageRoute(
                               builder: (_) => const FacultySettingsScreen()));
                     }),
@@ -868,8 +883,7 @@ if (!kIsWeb) {
                               SizedBox(height: 12),
                               Text(
                                 "A smart campus management app — stay updated with announcements, attendance, events, and more.",
-                                style:
-                                    TextStyle(fontSize: 13, height: 1.5),
+                                style: TextStyle(fontSize: 13, height: 1.5),
                               ),
                               SizedBox(height: 12),
                               Text("Developed as Final Year Project.",
@@ -896,8 +910,6 @@ if (!kIsWeb) {
                 ),
               ),
             ),
-
-            // Logout pinned at bottom
             const Divider(height: 1),
             ListTile(
               leading: const Icon(Icons.logout, color: Colors.red),
@@ -930,6 +942,12 @@ if (!kIsWeb) {
                   ),
                 );
                 if (confirmed == true) {
+                  // ✅ Fixed: clear OneSignal tags + logout before Firebase signOut
+                  if (!kIsWeb) {
+                    await OneSignal.User.removeTags(
+                        ['all_campus_tag', 'role', 'dept']);
+                    await OneSignalService.logoutUser();
+                  }
                   await FirebaseAuth.instance.signOut();
                   if (mounted) {
                     Navigator.pushReplacementNamed(context, '/login');
@@ -948,8 +966,8 @@ if (!kIsWeb) {
     return ListTile(
       leading: Icon(icon, color: const Color(0xFF8B0A1A), size: 22),
       title: Text(label,
-          style:
-              const TextStyle(fontSize: 14, fontWeight: FontWeight.w500)),
+          style: const TextStyle(
+              fontSize: 14, fontWeight: FontWeight.w500)),
       onTap: onTap,
       dense: true,
       horizontalTitleGap: 4,
@@ -976,9 +994,9 @@ class _AppLifecycleObserver extends WidgetsBindingObserver {
 class HeaderCurvedPainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
-    final Paint paint = Paint()..style = PaintingStyle.fill;
-    final double w = size.width;
-    final double h = size.height;
+    final paint = Paint()..style = PaintingStyle.fill;
+    final w = size.width;
+    final h = size.height;
 
     paint.color = const Color(0xFF5A060D);
     Path p1 = Path();
@@ -1010,11 +1028,11 @@ class HeaderCurvedPainter extends CustomPainter {
     p3.close();
     canvas.drawPath(p3, paint);
 
-    final Paint stroke = Paint()
-      ..color = const Color(0xFFFBC02D)
-      ..style = PaintingStyle.stroke
+    final stroke = Paint()
+      ..color       = const Color(0xFFFBC02D)
+      ..style       = PaintingStyle.stroke
       ..strokeWidth = 2.5
-      ..strokeCap = StrokeCap.round;
+      ..strokeCap   = StrokeCap.round;
     Path sp = Path();
     sp.moveTo(0, h * (182 / 230));
     sp.cubicTo(w * (112 / 412), h * (152 / 230),
