@@ -1,10 +1,14 @@
+
+
 // lib/settings/settings_screen.dart
 
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:hive_flutter/hive_flutter.dart';
+import '../services/onesignal_service.dart';
 
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
@@ -14,17 +18,17 @@ class SettingsScreen extends StatefulWidget {
 }
 
 class _SettingsScreenState extends State<SettingsScreen> {
-  // ── Notification toggles ───────────────────────────────────────────────────
+  // ── Notification toggles ──────────────────────────────────────────────
   bool _announcementNotifs = true;
-  bool _chatNotifs = true;
-  bool _urgentNotifs = true;
+  bool _chatNotifs         = true;
+  bool _urgentNotifs       = true;
 
-  // ── Profile data (editable) ────────────────────────────────────────────────
-  String _name = "";
-  String _email = "";
-  String _dept = "";
-  String _sem = "";
-  String _shift = "";
+  // ── Profile data ──────────────────────────────────────────────────────
+  String _name   = "";
+  String _email  = "";
+  String _dept   = "";
+  String _sem    = "";
+  String _shift  = "";
   String _rollNo = "";
   bool _isLoadingProfile = true;
 
@@ -39,8 +43,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final prefs = await SharedPreferences.getInstance();
     setState(() {
       _announcementNotifs = prefs.getBool('notif_announcements') ?? true;
-      _chatNotifs = prefs.getBool('notif_chat') ?? true;
-      _urgentNotifs = prefs.getBool('notif_urgent') ?? true;
+      _chatNotifs         = prefs.getBool('notif_chat')          ?? true;
+      _urgentNotifs       = prefs.getBool('notif_urgent')        ?? true;
     });
   }
 
@@ -60,12 +64,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
       if (doc.exists && mounted) {
         final d = doc.data()!;
         setState(() {
-          _name = (d['name'] ?? d['displayName'] ?? '').toString().trim();
-          _email = (d['email'] ?? user.email ?? '').toString().trim();
-          _dept = (d['dept'] ?? '').toString().trim();
-          _sem = (d['semester'] ?? d['sem'] ?? '').toString().trim();
-          _shift = (d['shift'] ?? '').toString().trim();
-          _rollNo = (d['rollNo'] ?? d['roll_no'] ?? '').toString().trim();
+          _name   = (d['name']     ?? d['displayName'] ?? '').toString().trim();
+          _email  = (d['email']    ?? user.email       ?? '').toString().trim();
+          _dept   = (d['dept']     ?? '').toString().trim();
+          _sem    = (d['semester'] ?? d['sem']          ?? '').toString().trim();
+          _shift  = (d['shift']    ?? '').toString().trim();
+          _rollNo = (d['rollNo']   ?? d['roll_no']      ?? '').toString().trim();
           _isLoadingProfile = false;
         });
       }
@@ -82,7 +86,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _showSnack("Announcement read history cleared.");
   }
 
-  // ── CLEAR CACHE ────────────────────────────────────────────────────────────
   Future<void> _clearCache() async {
     final confirmed = await showDialog<bool>(
       context: context,
@@ -117,15 +120,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
     try {
       const boxName = 'announcements_cache';
       if (Hive.isBoxOpen(boxName)) {
-        // Box is open as typed Box<Announcement> — use it directly
         final box = Hive.box<dynamic>(boxName);
         await box.clear();
       }
-      // Delete from disk so it reloads fresh next time
       await Hive.deleteBoxFromDisk(boxName);
       _showSnack("Cache cleared successfully.");
     } catch (e) {
-      // Even if clear() fails, deleteBoxFromDisk handles it
       try {
         await Hive.deleteBoxFromDisk('announcements_cache');
         _showSnack("Cache cleared successfully.");
@@ -135,15 +135,49 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
   }
 
-  // ── CHANGE PASSWORD ────────────────────────────────────────────────────────
+  // ── LOGOUT ────────────────────────────────────────────────────────────
+  Future<void> _handleLogout() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Text("Logout",
+            style: TextStyle(color: Color(0xFF8B0A1A))),
+        content: const Text("Are you sure you want to logout?"),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text("Cancel")),
+          ElevatedButton(
+            style:
+                ElevatedButton.styleFrom(backgroundColor: Colors.red),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text("Logout",
+                style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true) return;
+
+    // ✅ Clear OneSignal tags + logout before Firebase signOut
+    await OneSignalService.clearStudentTags();
+    await OneSignalService.logoutUser();
+
+    await FirebaseAuth.instance.signOut();
+    if (mounted) Navigator.pushReplacementNamed(context, '/login');
+  }
+
+  // ── CHANGE PASSWORD ────────────────────────────────────────────────────
   Future<void> _showChangePasswordDialog() async {
     final currentCtrl = TextEditingController();
-    final newCtrl = TextEditingController();
+    final newCtrl     = TextEditingController();
     final confirmCtrl = TextEditingController();
     bool obscureCurrent = true;
-    bool obscureNew = true;
+    bool obscureNew     = true;
     bool obscureConfirm = true;
-    bool isLoading = false;
+    bool isLoading      = false;
 
     await showDialog(
       context: context,
@@ -174,15 +208,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
             try {
               final user = FirebaseAuth.instance.currentUser;
               if (user == null) return;
-
-              // Re-authenticate first
               final cred = EmailAuthProvider.credential(
                   email: user.email!, password: current);
               await user.reauthenticateWithCredential(cred);
-
-              // Update password
               await user.updatePassword(newPass);
-
               Navigator.pop(ctx);
               _showSnack("Password changed successfully.");
             } on FirebaseAuthException catch (e) {
@@ -208,7 +237,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 borderRadius: BorderRadius.circular(20)),
             title: const Row(
               children: [
-                Icon(Icons.lock_outline, color: Color(0xFF8B0A1A), size: 22),
+                Icon(Icons.lock_outline,
+                    color: Color(0xFF8B0A1A), size: 22),
                 SizedBox(width: 8),
                 Text("Change Password",
                     style: TextStyle(
@@ -221,94 +251,31 @@ class _SettingsScreenState extends State<SettingsScreen> {
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  // Current password
-                  TextField(
+                  _passField(
                     controller: currentCtrl,
-                    obscureText: obscureCurrent,
-                    decoration: InputDecoration(
-                      labelText: "Current Password",
-                      prefixIcon: const Icon(Icons.lock_outline,
-                          color: Color(0xFF8B0A1A), size: 20),
-                      suffixIcon: IconButton(
-                        icon: Icon(
-                            obscureCurrent
-                                ? Icons.visibility_off_outlined
-                                : Icons.visibility_outlined,
-                            size: 20,
-                            color: Colors.grey),
-                        onPressed: () =>
-                            setDialog(() => obscureCurrent = !obscureCurrent),
-                      ),
-                      border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(12)),
-                      focusedBorder: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(12),
-                        borderSide: const BorderSide(
-                            color: Color(0xFF8B0A1A), width: 1.5),
-                      ),
-                      contentPadding: const EdgeInsets.symmetric(
-                          horizontal: 14, vertical: 12),
-                    ),
+                    label: "Current Password",
+                    icon: Icons.lock_outline,
+                    obscure: obscureCurrent,
+                    onToggle: () =>
+                        setDialog(() => obscureCurrent = !obscureCurrent),
                   ),
                   const SizedBox(height: 14),
-                  // New password
-                  TextField(
+                  _passField(
                     controller: newCtrl,
-                    obscureText: obscureNew,
-                    decoration: InputDecoration(
-                      labelText: "New Password",
-                      prefixIcon: const Icon(Icons.lock_reset_outlined,
-                          color: Color(0xFF8B0A1A), size: 20),
-                      suffixIcon: IconButton(
-                        icon: Icon(
-                            obscureNew
-                                ? Icons.visibility_off_outlined
-                                : Icons.visibility_outlined,
-                            size: 20,
-                            color: Colors.grey),
-                        onPressed: () =>
-                            setDialog(() => obscureNew = !obscureNew),
-                      ),
-                      border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(12)),
-                      focusedBorder: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(12),
-                        borderSide: const BorderSide(
-                            color: Color(0xFF8B0A1A), width: 1.5),
-                      ),
-                      contentPadding: const EdgeInsets.symmetric(
-                          horizontal: 14, vertical: 12),
-                    ),
+                    label: "New Password",
+                    icon: Icons.lock_reset_outlined,
+                    obscure: obscureNew,
+                    onToggle: () =>
+                        setDialog(() => obscureNew = !obscureNew),
                   ),
                   const SizedBox(height: 14),
-                  // Confirm password
-                  TextField(
+                  _passField(
                     controller: confirmCtrl,
-                    obscureText: obscureConfirm,
-                    decoration: InputDecoration(
-                      labelText: "Confirm New Password",
-                      prefixIcon: const Icon(Icons.check_circle_outline,
-                          color: Color(0xFF8B0A1A), size: 20),
-                      suffixIcon: IconButton(
-                        icon: Icon(
-                            obscureConfirm
-                                ? Icons.visibility_off_outlined
-                                : Icons.visibility_outlined,
-                            size: 20,
-                            color: Colors.grey),
-                        onPressed: () =>
-                            setDialog(() => obscureConfirm = !obscureConfirm),
-                      ),
-                      border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(12)),
-                      focusedBorder: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(12),
-                        borderSide: const BorderSide(
-                            color: Color(0xFF8B0A1A), width: 1.5),
-                      ),
-                      contentPadding: const EdgeInsets.symmetric(
-                          horizontal: 14, vertical: 12),
-                    ),
+                    label: "Confirm New Password",
+                    icon: Icons.check_circle_outline,
+                    obscure: obscureConfirm,
+                    onToggle: () =>
+                        setDialog(() => obscureConfirm = !obscureConfirm),
                   ),
                 ],
               ),
@@ -329,8 +296,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 onPressed: isLoading ? null : submit,
                 child: isLoading
                     ? const SizedBox(
-                        width: 18,
-                        height: 18,
+                        width: 18, height: 18,
                         child: CircularProgressIndicator(
                             color: Colors.white, strokeWidth: 2))
                     : const Text("Update",
@@ -343,23 +309,67 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
+  TextField _passField({
+    required TextEditingController controller,
+    required String label,
+    required IconData icon,
+    required bool obscure,
+    required VoidCallback onToggle,
+  }) {
+    return TextField(
+      controller: controller,
+      obscureText: obscure,
+      decoration: InputDecoration(
+        labelText: label,
+        prefixIcon: Icon(icon, color: const Color(0xFF8B0A1A), size: 20),
+        suffixIcon: IconButton(
+          icon: Icon(
+              obscure
+                  ? Icons.visibility_off_outlined
+                  : Icons.visibility_outlined,
+              size: 20,
+              color: Colors.grey),
+          onPressed: onToggle,
+        ),
+        border:
+            OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+        focusedBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+          borderSide:
+              const BorderSide(color: Color(0xFF8B0A1A), width: 1.5),
+        ),
+        contentPadding:
+            const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      ),
+    );
+  }
+
   void _showSnack(String msg, {bool isError = false}) {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(
       content: Row(children: [
-        Icon(isError ? Icons.error_outline : Icons.check_circle_outline,
-            color: Colors.white, size: 18),
+        Icon(
+            isError
+                ? Icons.error_outline
+                : Icons.check_circle_outline,
+            color: Colors.white,
+            size: 18),
         const SizedBox(width: 10),
-        Expanded(child: Text(msg,
-            style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w500))),
+        Expanded(
+            child: Text(msg,
+                style: const TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.w500))),
       ]),
       backgroundColor:
           isError ? Colors.red.shade700 : const Color(0xFF8B0A1A),
       behavior: SnackBarBehavior.floating,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      shape:
+          RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
       margin: const EdgeInsets.all(12),
     ));
   }
 
+  // ── BUILD ─────────────────────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -373,31 +383,32 @@ class _SettingsScreenState extends State<SettingsScreen> {
       ),
       body: _isLoadingProfile
           ? const Center(
-              child: CircularProgressIndicator(color: Color(0xFF8B0A1A)))
+              child: CircularProgressIndicator(
+                  color: Color(0xFF8B0A1A)))
           : ListView(
               padding: const EdgeInsets.all(16),
               children: [
-                // ── ACCOUNT SECTION ─────────────────────────────────────
+                // ── ACCOUNT ─────────────────────────────────────────
                 _sectionHeader("Account"),
                 _infoCard([
-                  _infoRow(Icons.person_outline, "Name", _name),
-                  _infoRow(Icons.email_outlined, "Email", _email),
-                  _infoRow(Icons.school_outlined, "Department", _dept),
-                  _infoRow(Icons.layers_outlined, "Semester", _sem),
-                  _infoRow(Icons.schedule_outlined, "Shift", _shift),
-                  _infoRow(Icons.badge_outlined, "Roll No", _rollNo),
+                  _infoRow(Icons.person_outline,   "Name",       _name),
+                  _infoRow(Icons.email_outlined,   "Email",      _email),
+                  _infoRow(Icons.school_outlined,  "Department", _dept),
+                  _infoRow(Icons.layers_outlined,  "Semester",   _sem),
+                  _infoRow(Icons.schedule_outlined,"Shift",      _shift),
+                  _infoRow(Icons.badge_outlined,   "Roll No",    _rollNo),
                 ]),
 
                 const SizedBox(height: 20),
 
-                // ── NOTIFICATIONS SECTION ───────────────────────────────
+                // ── NOTIFICATIONS ────────────────────────────────────
                 _sectionHeader("Notifications"),
                 _settingsCard([
                   _toggleTile(
-                    icon: Icons.campaign_outlined,
-                    title: "Announcement Notifications",
+                    icon    : Icons.campaign_outlined,
+                    title   : "Announcement Notifications",
                     subtitle: "Get notified when new announcements are posted",
-                    value: _announcementNotifs,
+                    value   : _announcementNotifs,
                     onChanged: (v) {
                       setState(() => _announcementNotifs = v);
                       _saveNotifPref('notif_announcements', v);
@@ -405,10 +416,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   ),
                   const Divider(height: 1, indent: 56),
                   _toggleTile(
-                    icon: Icons.chat_bubble_outline,
-                    title: "Chat Notifications",
+                    icon    : Icons.chat_bubble_outline,
+                    title   : "Chat Notifications",
                     subtitle: "Get notified for new messages",
-                    value: _chatNotifs,
+                    value   : _chatNotifs,
                     onChanged: (v) {
                       setState(() => _chatNotifs = v);
                       _saveNotifPref('notif_chat', v);
@@ -416,10 +427,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   ),
                   const Divider(height: 1, indent: 56),
                   _toggleTile(
-                    icon: Icons.warning_amber_outlined,
-                    title: "Urgent Alerts",
+                    icon    : Icons.warning_amber_outlined,
+                    title   : "Urgent Alerts",
                     subtitle: "Always show urgent/important notifications",
-                    value: _urgentNotifs,
+                    value   : _urgentNotifs,
                     onChanged: (v) {
                       setState(() => _urgentNotifs = v);
                       _saveNotifPref('notif_urgent', v);
@@ -429,10 +440,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
                 const SizedBox(height: 20),
 
-                // ── DATA & PRIVACY ──────────────────────────────────────
+                // ── DATA & PRIVACY ───────────────────────────────────
                 _sectionHeader("Data & Privacy"),
                 _settingsCard([
-                  // Change Password
                   ListTile(
                     leading: const Icon(Icons.lock_outline,
                         color: Color(0xFF8B0A1A), size: 22),
@@ -447,7 +457,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     dense: true,
                   ),
                   const Divider(height: 1, indent: 56),
-                  // Clear Cache
                   ListTile(
                     leading: const Icon(Icons.cleaning_services_outlined,
                         color: Color(0xFF8B0A1A), size: 22),
@@ -463,7 +472,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     dense: true,
                   ),
                   const Divider(height: 1, indent: 56),
-                  // Clear Read History
                   ListTile(
                     leading: const Icon(Icons.done_all_rounded,
                         color: Color(0xFF8B0A1A), size: 22),
@@ -479,8 +487,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     dense: true,
                   ),
                   const Divider(height: 1, indent: 56),
+                  // ✅ Logout with OneSignal cleanup
                   ListTile(
-                    leading: const Icon(Icons.logout, color: Colors.red, size: 22),
+                    leading: const Icon(Icons.logout,
+                        color: Colors.red, size: 22),
                     title: const Text("Logout",
                         style: TextStyle(
                             fontSize: 14,
@@ -488,12 +498,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             color: Colors.red)),
                     trailing: const Icon(Icons.chevron_right,
                         color: Colors.grey, size: 20),
-                    onTap: () async {
-                      await FirebaseAuth.instance.signOut();
-                      if (mounted) {
-                        Navigator.pushReplacementNamed(context, '/login');
-                      }
-                    },
+                    onTap: _handleLogout,
                     dense: true,
                   ),
                 ]),
@@ -518,9 +523,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
       child: Text(
         title.toUpperCase(),
         style: const TextStyle(
-          fontSize: 11,
-          fontWeight: FontWeight.bold,
-          color: Color(0xFF8B0A1A),
+          fontSize    : 11,
+          fontWeight  : FontWeight.bold,
+          color       : Color(0xFF8B0A1A),
           letterSpacing: 1.2,
         ),
       ),
@@ -532,8 +537,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
       decoration: BoxDecoration(
         color: Colors.white,
         borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: const Color(0xFFFBC02D).withOpacity(0.4)),
-        boxShadow: const [BoxShadow(color: Colors.black12, blurRadius: 6)],
+        border: Border.all(
+            color: const Color(0xFFFBC02D).withOpacity(0.4)),
+        boxShadow: const [
+          BoxShadow(color: Colors.black12, blurRadius: 6)
+        ],
       ),
       child: Column(children: children),
     );
@@ -545,7 +553,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
         color: Colors.white,
         borderRadius: BorderRadius.circular(16),
         border: Border.all(color: Colors.grey.shade200),
-        boxShadow: const [BoxShadow(color: Colors.black12, blurRadius: 6)],
+        boxShadow: const [
+          BoxShadow(color: Colors.black12, blurRadius: 6)
+        ],
       ),
       child: Column(children: children),
     );
@@ -587,14 +597,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
     return SwitchListTile(
       secondary: Icon(icon, color: const Color(0xFF8B0A1A), size: 22),
       title: Text(title,
-          style:
-              const TextStyle(fontSize: 14, fontWeight: FontWeight.w500)),
+          style: const TextStyle(
+              fontSize: 14, fontWeight: FontWeight.w500)),
       subtitle: Text(subtitle,
-          style: TextStyle(fontSize: 11, color: Colors.grey.shade500)),
-      value: value,
-      onChanged: onChanged,
+          style: TextStyle(
+              fontSize: 11, color: Colors.grey.shade500)),
+      value     : value,
+      onChanged : onChanged,
       activeColor: const Color(0xFF8B0A1A),
-      dense: true,
+      dense     : true,
     );
   }
 }

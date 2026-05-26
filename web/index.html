@@ -1,71 +1,81 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <!--
-    If you are serving your web app in a path other than the root, change the
-    href value below to reflect the base path you are serving from.
-
-    The path provided below has to start and end with a slash "/" in order for
-    it to work correctly.
-
-    For more details:
-    * https://developer.mozilla.org/en-US/docs/Web/HTML/Element/base
-
-    This is a placeholder for base href that will be replaced by the value of
-    the `--base-href` argument provided to `flutter build`.
-  -->
   <base href="$FLUTTER_BASE_HREF">
-
   <meta charset="UTF-8">
   <meta content="IE=Edge" http-equiv="X-UA-Compatible">
   <meta name="description" content="The essential campus connection app">
-
-  <!-- iOS meta tags & icons -->
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black">
   <meta name="apple-mobile-web-app-title" content="campus_pulse">
   <link rel="apple-touch-icon" href="icons/Icon-192.png">
-
-  <!-- Favicon -->
   <link rel="icon" type="image/png" href="favicon.png"/>
-
   <title>campus_pulse</title>
   <link rel="manifest" href="manifest.json">
 </head>
 <body>
-  <!--
-    You can customize the "flutter_bootstrap.js" script.
-    This is useful to provide a custom configuration to the Flutter loader
-    or to give the user feedback during the initialization process.
 
-    For more details:
-    * https://docs.flutter.dev/platform-integration/web/initialization
-  -->
-    <script src="https://cdn.onesignal.com/sdks/web/v16/OneSignalSDK.page.js" defer></script>
-<script>
-  window.OneSignalDeferred = window.OneSignalDeferred || [];
-  OneSignalDeferred.push(async function(OneSignal) {
-    console.log("Onesignal script trigger started...");
-    // Hum ne niche se direct ID mita kar window variable use kiya hai
-    await OneSignal.init({
-      appId: "02b5177a-5147-456c-aa7b-08912068cc01", 
-    allowLocalhostAsSecureOrigin: true, // 👈 Yeh line lazmi honi chahiye!
-    notifyButton: {
-      enable: true,
-      
-      },
-    });
-    console.log("Onesignal successfully initialized on Web!");
-  });
-</script>
-   
-  <script src="flutter_bootstrap.js" async></script>
-  <!--<script>
-    if ('serviceWorker' in navigator) {
-      window.addEventListener('load', function () {
-        navigator.serviceWorker.register('/firebase-messaging-sw.js');
+  <!-- ✅ OneSignal Web SDK v16 -->
+  <script src="https://cdn.onesignal.com/sdks/web/v16/OneSignalSDK.page.js" defer></script>
+
+  <script>
+    window.OneSignalDeferred = window.OneSignalDeferred || [];
+
+    OneSignalDeferred.push(async function(OneSignal) {
+      console.log("✅ OneSignal: Initializing on Web...");
+
+      await OneSignal.init({
+        appId                    : "02b5177a-5147-456c-aa7b-08912068cc01",
+        allowLocalhostAsSecureOrigin: true,
+        notifyButton             : { enable: true },
+        // ✅ Prompt user for permission on first visit
+        promptOptions: {
+          slidedown: {
+            prompts: [{
+              type    : "push",
+              autoPrompt: true,
+              text    : {
+                actionMessage         : "Campus Pulse wants to send you notifications for announcements and messages.",
+                acceptButton          : "Allow",
+                cancelButton          : "No Thanks",
+              },
+            }]
+          }
+        }
       });
-    }
-  </script>-->
+
+      console.log("✅ OneSignal Web initialized!");
+
+      // ✅ BRIDGE: Flutter Dart code yeh function call karega login ke baad
+      // OneSignalService.loginUser() web pe yeh trigger karta hai
+      window.oneSignalWebLogin = async function(firebaseUid) {
+        try {
+          await OneSignal.login(firebaseUid);
+          console.log("✅ OneSignal Web login: uid=" + firebaseUid);
+
+          // Sub ID read karo aur Flutter ko pass karo
+          const subId = OneSignal.User.PushSubscription.id;
+          if (subId) {
+            console.log("✅ OneSignal Web subId: " + subId);
+            // Flutter ka dart:js bridge use karta hai — yeh window pe store karo
+            window._osWebSubId = subId;
+          }
+        } catch(e) {
+          console.error("❌ OneSignal Web login error:", e);
+        }
+      };
+
+      window.oneSignalWebLogout = async function() {
+        try {
+          await OneSignal.logout();
+          console.log("✅ OneSignal Web logout");
+        } catch(e) {
+          console.error("❌ OneSignal Web logout:", e);
+        }
+      };
+    });
+  </script>
+
+  <script src="flutter_bootstrap.js" async></script>
 </body>
 </html>
